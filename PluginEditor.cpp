@@ -1,19 +1,25 @@
 #include "PluginEditor.h"
 #include <JuceHeader.h>
 
-LDSJvstAudioProcessorEditor::OscilloscopeComponent::OscilloscopeComponent(LDSJvstAudioProcessor& p)
+PuponvstAudioProcessorEditor::OscilloscopeComponent::OscilloscopeComponent(PuponvstAudioProcessor& p)
     : processor(p)
 {
     startTimerHz(30);
 }
 
-void LDSJvstAudioProcessorEditor::OscilloscopeComponent::timerCallback()
+PuponvstAudioProcessorEditor::OscilloscopeComponent::~OscilloscopeComponent()
+{
+    // 必须在对象销毁前停止定时器，避免回调时访问已销毁对象导致崩溃/卡死
+    stopTimer();
+}
+
+void PuponvstAudioProcessorEditor::OscilloscopeComponent::timerCallback()
 {
     processor.getOscilloscopeSnapshot(samples);
     repaint();
 }
 
-void LDSJvstAudioProcessorEditor::OscilloscopeComponent::paint(juce::Graphics& g)
+void PuponvstAudioProcessorEditor::OscilloscopeComponent::paint(juce::Graphics& g)
 {
     auto b = getLocalBounds().toFloat();
 
@@ -53,7 +59,7 @@ void LDSJvstAudioProcessorEditor::OscilloscopeComponent::paint(juce::Graphics& g
     g.strokePath(waveform, juce::PathStrokeType(2.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
 }
 
-LDSJvstAudioProcessorEditor::LDSJvstAudioProcessorEditor(LDSJvstAudioProcessor& p)
+PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcessor& p)
     : juce::AudioProcessorEditor(&p), processor(p)
 {
     setResizable(true, true);
@@ -70,14 +76,14 @@ LDSJvstAudioProcessorEditor::LDSJvstAudioProcessorEditor(LDSJvstAudioProcessor& 
     addAndMakeVisible(bypassButton);
 }
 
-LDSJvstAudioProcessorEditor::~LDSJvstAudioProcessorEditor() {}
+PuponvstAudioProcessorEditor::~PuponvstAudioProcessorEditor() {}
 
-void LDSJvstAudioProcessorEditor::paint(juce::Graphics& g)
+void PuponvstAudioProcessorEditor::paint(juce::Graphics& g)
 {
     g.fillAll(juce::Colours::darkgrey);
 }
 
-void LDSJvstAudioProcessorEditor::resized()
+void PuponvstAudioProcessorEditor::resized()
 {
     auto area = getLocalBounds().reduced(12);
 

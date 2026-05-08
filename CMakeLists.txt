@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(LDSJvst VERSION 1.0.0 LANGUAGES CXX)
+project(Puponvst VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,35 +13,37 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(juce)
 
-add_subdirectory(grid_plugin)
-
 juce_add_plugin(
-        LDSJvst
-        PRODUCT_NAME "LDSJvst"
+        Puponvst
+        PRODUCT_NAME "Pupon"
         VERSION 0.1.0
-        COMPANY_NAME "YourCompany"
-        PLUGIN_MANUFACTURER_CODE Ldsj
-        PLUGIN_CODE Ldsj
-        FORMATS VST3 Standalone
+        COMPANY_NAME "iisaacbeas.cn"
+        BUNDLE_ID "cn.iisaacbeas.Pupon"
+        PLUGIN_MANUFACTURER_CODE Pupo
+        PLUGIN_CODE Pupn
+        # 注意：AU 仅能在 macOS 上构建，其它平台会被 JUCE 自动忽略
+        FORMATS VST3 AU Standalone
         IS_SYNTH FALSE
         NEEDS_MIDI_INPUT FALSE
         NEEDS_MIDI_OUTPUT FALSE
         VST3_AUTO_MANIFEST FALSE
+        # AU 必需的插件分类（效果器）
+        AU_MAIN_TYPE kAudioUnitType_Effect
         COPY_PLUGIN_AFTER_BUILD TRUE
 )
 
-juce_generate_juce_header(LDSJvst)
+juce_generate_juce_header(Puponvst)
 
-target_compile_definitions(LDSJvst
+target_compile_definitions(Puponvst
   PUBLIC
     JUCE_VST3_CAN_REPLACE_VST2=0
 )
 
-target_sources(LDSJvst PRIVATE
+target_sources(Puponvst PRIVATE
   PluginProcessor.cpp
   PluginProcessor.h
   PluginEditor.cpp
   PluginEditor.h
 )
 
-target_link_libraries(LDSJvst PRIVATE grid::grid_plugin juce::juce_audio_utils)
+target_link_libraries(Puponvst PRIVATE juce::juce_audio_utils)

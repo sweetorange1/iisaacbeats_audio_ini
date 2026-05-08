@@ -3,11 +3,11 @@
 #include <JuceHeader.h>
 #include <array>
 
-class LDSJvstAudioProcessor : public juce::AudioProcessor
+class PuponvstAudioProcessor : public juce::AudioProcessor
 {
 public:
-    LDSJvstAudioProcessor();
-    ~LDSJvstAudioProcessor() override;
+    PuponvstAudioProcessor();
+    ~PuponvstAudioProcessor() override;
 
     // AudioProcessor overrides
     bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
@@ -47,5 +47,5 @@ private:
     std::array<float, oscilloscopeBufferSize> oscilloscopeBuffer {};
     int oscilloscopeWritePos = 0;
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LDSJvstAudioProcessor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PuponvstAudioProcessor)
 };

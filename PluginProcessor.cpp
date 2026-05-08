@@ -2,7 +2,7 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-LDSJvstAudioProcessor::LDSJvstAudioProcessor()
+PuponvstAudioProcessor::PuponvstAudioProcessor()
     : juce::AudioProcessor (BusesProperties()
 #if ! JucePlugin_IsMidiEffect
 #if ! JucePlugin_IsSynth
@@ -14,9 +14,19 @@ LDSJvstAudioProcessor::LDSJvstAudioProcessor()
 {
 }
 
-LDSJvstAudioProcessor::~LDSJvstAudioProcessor() {}
+PuponvstAudioProcessor::~PuponvstAudioProcessor() 
+{
+    // 调试信息：析构函数开始执行
+    DBG("PuponvstAudioProcessor destructor called");
+    
+    // 清理资源 - 不需要获取锁，因为对象即将被销毁
+    oscilloscopeWritePos = 0;
+    std::fill(oscilloscopeBuffer.begin(), oscilloscopeBuffer.end(), 0.0f);
+    
+    DBG("PuponvstAudioProcessor destructor completed successfully");
+}
 
-bool LDSJvstAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+bool PuponvstAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
 {
 #if JucePlugin_IsMidiEffect
     juce::ignoreUnused (layouts);
@@ -37,16 +47,16 @@ bool LDSJvstAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) 
 #endif
 }
 
-void LDSJvstAudioProcessor::prepareToPlay(double, int)
+void PuponvstAudioProcessor::prepareToPlay(double, int)
 {
     const juce::SpinLock::ScopedLockType sl(oscilloscopeLock);
     std::fill(oscilloscopeBuffer.begin(), oscilloscopeBuffer.end(), 0.0f);
     oscilloscopeWritePos = 0;
 }
 
-void LDSJvstAudioProcessor::releaseResources() {}
+void PuponvstAudioProcessor::releaseResources() {}
 
-void LDSJvstAudioProcessor::pushSamplesToOscilloscope(const float* samples, int numSamples)
+void PuponvstAudioProcessor::pushSamplesToOscilloscope(const float* samples, int numSamples)
 {
     if (samples == nullptr || numSamples <= 0)
         return;
@@ -60,7 +70,7 @@ void LDSJvstAudioProcessor::pushSamplesToOscilloscope(const float* samples, int 
     }
 }
 
-void LDSJvstAudioProcessor::getOscilloscopeSnapshot(juce::Array<float>& dest)
+void PuponvstAudioProcessor::getOscilloscopeSnapshot(juce::Array<float>& dest)
 {
     dest.resize(oscilloscopeBufferSize);
 
@@ -74,7 +84,7 @@ void LDSJvstAudioProcessor::getOscilloscopeSnapshot(juce::Array<float>& dest)
     }
 }
 
-void LDSJvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
 {
     juce::ScopedNoDenormals noDenormals;
 
@@ -92,26 +102,26 @@ void LDSJvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce:
         pushSamplesToOscilloscope(buffer.getReadPointer(0), buffer.getNumSamples());
 }
 
-juce::AudioProcessorEditor* LDSJvstAudioProcessor::createEditor() { return new LDSJvstAudioProcessorEditor(*this); }
-bool LDSJvstAudioProcessor::hasEditor() const { return true; }
+juce::AudioProcessorEditor* PuponvstAudioProcessor::createEditor() { return new PuponvstAudioProcessorEditor(*this); }
+bool PuponvstAudioProcessor::hasEditor() const { return true; }
 
-const juce::String LDSJvstAudioProcessor::getName() const { return "LDSJvst"; }
-bool LDSJvstAudioProcessor::acceptsMidi() const { return false; }
-bool LDSJvstAudioProcessor::producesMidi() const { return false; }
-bool LDSJvstAudioProcessor::isMidiEffect() const { return false; }
-double LDSJvstAudioProcessor::getTailLengthSeconds() const { return 0.0; }
+const juce::String PuponvstAudioProcessor::getName() const { return "Puponvst"; }
+bool PuponvstAudioProcessor::acceptsMidi() const { return false; }
+bool PuponvstAudioProcessor::producesMidi() const { return false; }
+bool PuponvstAudioProcessor::isMidiEffect() const { return false; }
+double PuponvstAudioProcessor::getTailLengthSeconds() const { return 0.0; }
 
-int LDSJvstAudioProcessor::getNumPrograms() { return 1; }
-int LDSJvstAudioProcessor::getCurrentProgram() { return 0; }
-void LDSJvstAudioProcessor::setCurrentProgram(int) {}
-const juce::String LDSJvstAudioProcessor::getProgramName(int) { return {}; }
-void LDSJvstAudioProcessor::changeProgramName(int, const juce::String&) {}
+int PuponvstAudioProcessor::getNumPrograms() { return 1; }
+int PuponvstAudioProcessor::getCurrentProgram() { return 0; }
+void PuponvstAudioProcessor::setCurrentProgram(int) {}
+const juce::String PuponvstAudioProcessor::getProgramName(int) { return {}; }
+void PuponvstAudioProcessor::changeProgramName(int, const juce::String&) {}
 
-void LDSJvstAudioProcessor::getStateInformation(juce::MemoryBlock&) {}
-void LDSJvstAudioProcessor::setStateInformation(const void*, int) {}
+void PuponvstAudioProcessor::getStateInformation(juce::MemoryBlock&) {}
+void PuponvstAudioProcessor::setStateInformation(const void*, int) {}
 
 // 插件入口实现
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
-    return new LDSJvstAudioProcessor();
+    return new PuponvstAudioProcessor();
 }

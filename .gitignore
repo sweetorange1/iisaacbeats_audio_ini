@@ -1,0 +1,32 @@
+# Build directories
+cmake-build-*/
+build/
+Builds/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# JUCE generated files
+JuceLibraryCode/
+.gradle/
+
+# Binary files
+*.exe
+*.dll
+*.so
+*.dylib
+*.vst3
+*.component
+*.app
+
+# Temporary files
+*.log
+*.tmp

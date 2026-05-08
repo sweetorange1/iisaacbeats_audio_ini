@@ -3,11 +3,11 @@
 #include <JuceHeader.h>
 #include "PluginProcessor.h"
 
-class LDSJvstAudioProcessorEditor : public juce::AudioProcessorEditor
+class PuponvstAudioProcessorEditor : public juce::AudioProcessorEditor
 {
 public:
-    LDSJvstAudioProcessorEditor(LDSJvstAudioProcessor&);
-    ~LDSJvstAudioProcessorEditor() override;
+    PuponvstAudioProcessorEditor(PuponvstAudioProcessor&);
+    ~PuponvstAudioProcessorEditor() override;
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -17,23 +17,23 @@ private:
                                         private juce::Timer
     {
     public:
-        explicit OscilloscopeComponent(LDSJvstAudioProcessor&);
+        explicit OscilloscopeComponent(PuponvstAudioProcessor&);
+        ~OscilloscopeComponent() override;
 
         void paint(juce::Graphics&) override;
 
     private:
         void timerCallback() override;
 
-        LDSJvstAudioProcessor& processor;
+        PuponvstAudioProcessor& processor;
         juce::Array<float> samples;
 
         JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(OscilloscopeComponent)
     };
 
-    LDSJvstAudioProcessor& processor;
+    PuponvstAudioProcessor& processor;
     OscilloscopeComponent oscilloscope { processor };
     juce::TextButton bypassButton { "Bypass" };
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(LDSJvstAudioProcessorEditor)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PuponvstAudioProcessorEditor)
 };
-
