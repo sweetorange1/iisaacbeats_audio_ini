@@ -13,6 +13,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(juce)
 
+# ===== Rubber Band Library（GPL，适用于本开源项目）=====
+# 仅拉取源码，不执行它的 Meson 构建；我们用官方提供的 single-file unity
+# （single/RubberBandSingle.cpp）把整个库以源码形式编进本插件。
+FetchContent_Declare(
+        rubberband
+        GIT_REPOSITORY https://github.com/breakfastquay/rubberband.git
+        GIT_TAG        v4.0.0
+)
+# 用 Populate 而不是 MakeAvailable，避免触发其顶层构建脚本
+FetchContent_GetProperties(rubberband)
+if(NOT rubberband_POPULATED)
+    FetchContent_Populate(rubberband)
+endif()
+
 juce_add_plugin(
         Puponvst
         PRODUCT_NAME "Pupon"
@@ -34,6 +48,12 @@ juce_add_plugin(
 
 juce_generate_juce_header(Puponvst)
 
+# ===== 字体资源：AtomicMarker.otf 嵌入到 BinaryData =====
+juce_add_binary_data(PuponvstBinaryData
+  SOURCES
+    otf/AtomicMarker.otf
+)
+
 target_compile_definitions(Puponvst
   PUBLIC
     JUCE_VST3_CAN_REPLACE_VST2=0
@@ -44,6 +64,40 @@ target_sources(Puponvst PRIVATE
   PluginProcessor.h
   PluginEditor.cpp
   PluginEditor.h
+  PitchShiftEngine.cpp
+  PitchShiftEngine.h
+  TapeWobble.cpp
+  TapeWobble.h
+  # Rubber Band single-file unity build（见官方 single/RubberBandSingle.cpp 说明，
+  # 里面已内置 USE_BUILTIN_FFT / USE_BQRESAMPLER / NO_THREADING 等宏）
+  ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
 )
 
-target_link_libraries(Puponvst PRIVATE juce::juce_audio_utils)
+# 针对 Rubber Band 源文件单独设置 NOMINMAX（防止 <windows.h> 的 min/max 宏
+# 污染 std::min / std::max）以及 _USE_MATH_DEFINES（Rubber Band 用了 M_PI 等）。
+# 只作用于该源文件，不影响 JUCE 及本插件其它代码。
+if(MSVC)
+    set_source_files_properties(
+        ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
+        PROPERTIES
+        COMPILE_DEFINITIONS "NOMINMAX;_USE_MATH_DEFINES;_CRT_SECURE_NO_WARNINGS"
+    )
+else()
+    set_source_files_properties(
+        ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
+        PROPERTIES
+        COMPILE_DEFINITIONS "_USE_MATH_DEFINES"
+    )
+endif()
+
+# Rubber Band 头文件位置：<include>/rubberband/RubberBandLiveShifter.h
+target_include_directories(Puponvst PRIVATE
+  ${rubberband_SOURCE_DIR}
+)
+
+# Apple 平台下 Rubber Band 会用 vDSP（Accelerate framework）
+if(APPLE)
+    target_link_libraries(Puponvst PRIVATE "-framework Accelerate")
+endif()
+
+target_link_libraries(Puponvst PRIVATE juce::juce_audio_utils juce::juce_dsp PuponvstBinaryData)
