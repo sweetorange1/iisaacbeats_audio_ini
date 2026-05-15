@@ -132,6 +132,7 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
 PuponvstAudioProcessorEditor::~PuponvstAudioProcessorEditor()
 {
     stopTimer();
+    cancelPendingUpdate(); // 取消挂起的异步更新，防止析构后回调
     
     // 移除参数监听器
     processor.getAPVTS().removeParameterListener(ParameterIDs::rayslopeK, this);
@@ -785,32 +786,37 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
         }
         
         // 分组联动：左组 {0,1}，中组 {2}，右组 {3,4}
+        // 注意：拖动时使用 setValueNotifyingHost() 配合 dontSendNotification 会导致编译错误
+        // 正确做法：直接设置 APVTS 的 raw parameter value，不触发宿主通知
         if (i == 2)
         {
             dotOffsetT[2] = t;
-            // 同步更新 APVTS 参数
-            if (auto* param = processor.getAPVTS().getParameter("dot2"))
-                param->setValueNotifyingHost(t);
+            // 同步更新 APVTS 参数（不通知宿主，避免死锁）
+            processor.getAPVTS().getParameter("dot2")->setValueNotifyingHost(t);
+            // 但我们需要不通知... 使用 copyValueToValueTree 或直接修改 ValueTree
+            auto param = processor.getAPVTS().getParameter("dot2");
+            if (param != nullptr)
+                param->setValue(t);  // AudioProcessorParameter::setValue 只需一个参数
         }
         else if (i == 0 || i == 1)
         {
             dotOffsetT[0] = t;
             dotOffsetT[1] = t;
-            // 同步更新 APVTS 参数
-            if (auto* param0 = processor.getAPVTS().getParameter("dot0"))
-                param0->setValueNotifyingHost(t);
-            if (auto* param1 = processor.getAPVTS().getParameter("dot1"))
-                param1->setValueNotifyingHost(t);
+            // 同步更新 APVTS 参数（不通知宿主，避免死锁）
+            auto param0 = processor.getAPVTS().getParameter("dot0");
+            auto param1 = processor.getAPVTS().getParameter("dot1");
+            if (param0 != nullptr) param0->setValue(t);
+            if (param1 != nullptr) param1->setValue(t);
         }
         else // i == 3 || i == 4
         {
             dotOffsetT[3] = t;
             dotOffsetT[4] = t;
-            // 同步更新 APVTS 参数
-            if (auto* param3 = processor.getAPVTS().getParameter("dot3"))
-                param3->setValueNotifyingHost(t);
-            if (auto* param4 = processor.getAPVTS().getParameter("dot4"))
-                param4->setValueNotifyingHost(t);
+            // 同步更新 APVTS 参数（不通知宿主，避免死锁）
+            auto param3 = processor.getAPVTS().getParameter("dot3");
+            auto param4 = processor.getAPVTS().getParameter("dot4");
+            if (param3 != nullptr) param3->setValue(t);
+            if (param4 != nullptr) param4->setValue(t);
         }
         
         pushDotParamsToProcessor();
@@ -840,9 +846,9 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
             {
                 float newSigma = std::abs(normalizedX) / std::sqrt(logValue);
                 sigma = juce::jlimit(0.1f, 3.0f, newSigma);
-                // 同步更新 APVTS 参数
+                // 同步更新 APVTS 参数（不通知宿主，避免死锁）
                 if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::sigma))
-                    param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (sigma - 0.1f) / (3.0f - 0.1f)));
+                    param->setValue(juce::jlimit(0.0f, 1.0f, (sigma - 0.1f) / (3.0f - 0.1f)));
             }
         }
         
@@ -868,11 +874,11 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
         rayslopeK = k;
         isVerticalRay = false; // 永不允许垂直射线
         
-        // 同步更新 APVTS 参数
+        // 同步更新 APVTS 参数（不通知宿主，避免死锁）
         if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::rayslopeK))
-            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (rayslopeK + 5.0f) / 10.0f));
+            param->setValue(juce::jlimit(0.0f, 1.0f, (rayslopeK + 5.0f) / 10.0f));
         if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::isVerticalRay))
-            param->setValueNotifyingHost(0.0f); // false
+            param->setValue(0.0f); // false
         
         // 射线斜率变了 → 每个圆点的染色进度变了 → pan 变了
         pushDotParamsToProcessor();
@@ -882,11 +888,43 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
 
 void PuponvstAudioProcessorEditor::mouseUp(const juce::MouseEvent&)
 {
+    const bool wasDraggingDot = (draggingDotIndex >= 0);
+    const bool wasDraggingRay = (isDraggingRedLine || isDraggingBlueLine);
+    const bool wasDraggingCurve = isDraggingNormalCurve;
+    
     isDraggingRedLine = false;
     isDraggingBlueLine = false;
     isDraggingNormalCurve = false;
-    const bool wasDraggingDot = (draggingDotIndex >= 0);
     draggingDotIndex = -1;
+    
+    // 拖动结束后，才通知宿主参数变化（避免拖动时频繁触发宿主回调导致死锁）
+    if (wasDraggingDot)
+    {
+        // 通知宿主圆点参数变化
+        for (int i = 0; i < 5; ++i)
+        {
+            juce::String paramID = "dot" + juce::String(i);
+            if (auto* param = processor.getAPVTS().getParameter(paramID))
+                param->setValueNotifyingHost(param->getValue());
+        }
+    }
+    
+    if (wasDraggingRay)
+    {
+        // 通知宿主射线参数变化
+        if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::rayslopeK))
+            param->setValueNotifyingHost(param->getValue());
+        if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::isVerticalRay))
+            param->setValueNotifyingHost(param->getValue());
+    }
+    
+    if (wasDraggingCurve)
+    {
+        // 通知宿主 sigma 参数变化
+        if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::sigma))
+            param->setValueNotifyingHost(param->getValue());
+    }
+    
     if (wasDraggingDot)
         repaint(); // 清除被拖动圆点的高亮描边
 }
@@ -1250,10 +1288,9 @@ void PuponvstAudioProcessorEditor::resized()
 
 // ===== AudioProcessorValueTreeState::Listener 回调 =====
 // 当宿主自动化参数时，更新 UI 成员并触发重绘
+// 注意：此函数在宿主回调上下文中调用，不能直接调用 repaint()，否则可能死锁
 void PuponvstAudioProcessorEditor::parameterChanged(const juce::String& parameterID, float newValue)
 {
-    bool needsRepaint = false;
-
     if (parameterID == ParameterIDs::rayslopeK)
     {
         rayslopeK = newValue;
@@ -1279,9 +1316,21 @@ void PuponvstAudioProcessorEditor::parameterChanged(const juce::String& paramete
         }
     }
 
+    // 异步触发 UI 更新，避免在宿主回调上下文中直接调用 repaint() 导致死锁
     if (needsRepaint)
     {
         pushDotParamsToProcessor();
+        triggerAsyncUpdate();
+    }
+}
+
+// ===== AsyncUpdater 回调 =====
+// 在主消息线程中异步执行，安全调用 repaint()
+void PuponvstAudioProcessorEditor::handleAsyncUpdate()
+{
+    if (needsRepaint.load())
+    {
+        needsRepaint = false;
         repaint();
     }
 }

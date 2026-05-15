@@ -6,7 +6,8 @@
 
 class PuponvstAudioProcessorEditor : public juce::AudioProcessorEditor,
                                      private juce::Timer,
-                                     private juce::AudioProcessorValueTreeState::Listener
+                                     private juce::AudioProcessorValueTreeState::Listener,
+                                     private juce::AsyncUpdater
 {
 public:
     PuponvstAudioProcessorEditor(PuponvstAudioProcessor&);
@@ -106,10 +107,16 @@ private:
     // AudioProcessorValueTreeState::Listener 回调 - 响应参数自动化
     void parameterChanged(const juce::String& parameterID, float newValue) override;
 
+    // AsyncUpdater 回调 - 异步触发 UI 更新，避免参数回调中的死锁
+    void handleAsyncUpdate() override;
+
     // 构造函数初始化标志：在构造完成前为 false，期间 setSize() 触发的早期 resized()
     // 不应该把"还未恢复完毕"的成员值（默认 0/1 等）镜像到 Processor 的 editorState，
     // 否则会覆盖宿主 setStateInformation 恢复出的真存档，导致参数无法保存。
     bool initialised = false;
+
+    // 标记是否有待处理的参数变化需要重绘
+    std::atomic<bool> needsRepaint{false};
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PuponvstAudioProcessorEditor)
 };
