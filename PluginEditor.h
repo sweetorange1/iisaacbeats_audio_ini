@@ -5,7 +5,8 @@
 #include "PluginProcessor.h"
 
 class PuponvstAudioProcessorEditor : public juce::AudioProcessorEditor,
-                                     private juce::Timer
+                                     private juce::Timer,
+                                     private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     PuponvstAudioProcessorEditor(PuponvstAudioProcessor&);
@@ -62,15 +63,6 @@ private:
     std::array<float, 5> dotOffsetT { 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
     int draggingDotIndex = -1; // -1 表示没有拖动圆点；否则为 0..4
 
-    // ===== 黄色颤音控制器（横线） =====
-    // vibratoT ∈ [0, 1]：0 = 线位于控制区最底部（无颤音），1 = 线位于控制区最顶部（最大颤音）
-    // 由用户上下拖动这条横线改变。
-    //   t ∈ [0, 0.15] 为死区（黄线仍是直线，无任何颤音）
-    //   t ∈ [0.15, 1.0] 时颤音生效，振幅按 (t - 0.15)/0.85 线性映射
-    // 初始值给一点（0.05），刚好处于死区边界 → 默认无颤音
-    float vibratoT = 0.05f;
-    bool  isDraggingReverbLine = false;
-    
     // 控制区域下边缘中点（射线发射原点，屏幕坐标）
     juce::Point<float> bottomCenter;
     
@@ -111,25 +103,13 @@ private:
     // 调用时机：初始化、拖动圆点 / 射线 / 正态曲线之后、窗口 resize 之后
     void pushDotParamsToProcessor();
 
+    // AudioProcessorValueTreeState::Listener 回调 - 响应参数自动化
+    void parameterChanged(const juce::String& parameterID, float newValue) override;
+
     // 构造函数初始化标志：在构造完成前为 false，期间 setSize() 触发的早期 resized()
     // 不应该把"还未恢复完毕"的成员值（默认 0/1 等）镜像到 Processor 的 editorState，
     // 否则会覆盖宿主 setStateInformation 恢复出的真存档，导致参数无法保存。
     bool initialised = false;
-
-    // 黄色颤音横线的屏幕 Y 坐标
-    //   t = 0 → 控制区底部   t = 1 → 控制区顶部
-    float getReverbLineY(const juce::Rectangle<int>& controlArea) const;
-
-    // 黄色颤音横线当前的"正弦振幅"（像素），与 paint 中的绘制保持一致。
-    // 死区时返回 0；进入颤音区后随归一化深度从 0 → maxAmp。
-    // 用途：mouseDown 判定时把命中区域随波形振幅一起放大，避免波峰/波谷处点击穿过线。
-    float getReverbWaveAmplitudePx(const juce::Rectangle<int>& controlArea) const;
-
-    // 视觉位置 t_visual → 推送给 processor 的 vibratoT_audio 的非线性映射（前缓后陡）
-    // 设计：在死区(t<0.15)内保持线性（直接透传），死区外用 gamma=2.5 的幂曲线
-    //       让前 70% 的拖动行程内仅产生 ~30% 的颤音强度，最后 30% 行程产生剩余 70%。
-    // 输入/输出都是 [0, 1]；视觉位置不变（黄线 Y 仍按 t_visual 显示），仅改变音频端深度感知。
-    static float mapVibratoVisualToAudio(float tVisual) noexcept;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PuponvstAudioProcessorEditor)
 };

@@ -11,8 +11,18 @@ PuponvstAudioProcessor::PuponvstAudioProcessor()
 #endif
         .withOutput ("Output", juce::AudioChannelSet::stereo(), true)
 #endif
-    )
+    ),
+      apvts(*this, nullptr, "PARAMETERS", createParameterLayout())
 {
+    // 添加参数变化监听
+    apvts.addParameterListener(ParameterIDs::rayslopeK, this);
+    apvts.addParameterListener(ParameterIDs::isVerticalRay, this);
+    apvts.addParameterListener(ParameterIDs::sigma, this);
+    apvts.addParameterListener(ParameterIDs::dot0, this);
+    apvts.addParameterListener(ParameterIDs::dot1, this);
+    apvts.addParameterListener(ParameterIDs::dot2, this);
+    apvts.addParameterListener(ParameterIDs::dot3, this);
+    apvts.addParameterListener(ParameterIDs::dot4, this);
 }
 
 PuponvstAudioProcessor::~PuponvstAudioProcessor() 
@@ -58,12 +68,7 @@ void PuponvstAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
     const int numCh = juce::jmax(getTotalNumInputChannels(), getTotalNumOutputChannels());
     pitchEngine.prepare(sampleRate, samplesPerBlock, numCh);
 
-    // 初始化老磁带跳调模块（先喂一个默认 wow 频率：120 BPM 4/4 → 一小节 = 2s → 0.5 Hz）
-    tapeWobble.setWowFrequencyHz(1.0 / 2.0);
-    tapeWobble.prepare(sampleRate, samplesPerBlock, numCh);
-
-    // 颗音视觉状态复位
-    vibDepthDisplay.store(0.0f, std::memory_order_relaxed);
+    // 状态复位
     lastBarSeconds = 2.0;
 
     // 把 Rubber Band LiveShifter 的启动延迟上报给宿主 DAW，便于延迟补偿
@@ -73,7 +78,6 @@ void PuponvstAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
 void PuponvstAudioProcessor::releaseResources()
 {
     pitchEngine.reset();
-    tapeWobble.reset();
 }
 
 void PuponvstAudioProcessor::pushSamplesToOscilloscope(const float* samples, int numSamples)
@@ -118,20 +122,7 @@ void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
     const int numSamples = buffer.getNumSamples();
     juce::ignoreUnused(numSamples);
 
-    // ===== 1. 计算本 block 的颗音深度 =====
-    // 死区已取消：t 直接作为归一化深度。
-    // 编辑器端已对视觉 t 做 gamma=2.5 非线性映射（前缓后陡），所以
-    // 0~0.15 视觉位置对应到这里只剩极小的 audio t（≤ ~1%），听感上是"非常微弱的活气"。
-    const float t = vibratoT.load(std::memory_order_relaxed);
-    const float depthNorm = juce::jlimit(0.0f, 1.0f, t);
-
-    // 推送深度给 TapeWobble（独立于 RubberBand 的老磁带跳调模块）
-    tapeWobble.setDepth(depthNorm);
-
-    // ===== 1.5 从宿主 PlayHead 拿一小节秒数 → 推送 wow 频率 =====
-    // wow 主 LFO 周期 = 一小节（一小节完整波动一次回到起点），
-    // 振幅会在 TapeWobble 内部按 1/f 反推，因此无论 BPM 多少，听感上
-    // 最大跑调音程恒定在 ±2 半音 × depth。
+    // ===== 从宿主 PlayHead 获取 BPM 和拍号信息 =====
     {
         double barSeconds = lastBarSeconds;
         if (auto* ph = getPlayHead())
@@ -151,21 +142,10 @@ void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
                 lastBarSeconds = barSeconds;
             }
         }
-        const double wowHz = 1.0 / juce::jmax(1.0e-3, barSeconds);
-        tapeWobble.setWowFrequencyHz(wowHz);
     }
 
-    // 同步视觉深度给 UI（相位由 TapeWobble 内部提供从而与听感同步）
-    vibDepthDisplay.store(depthNorm, std::memory_order_relaxed);
-
-    // ===== 2. 核心音频处理：5 路重采样 pitch shift + 混音 + 声相 + 硬削波 =====
-    if (! bypassed)
-    {
-        pitchEngine.process(buffer);
-        // ===== 3. 老磁带跳调（处理链末端，变长延迟线 + Hermite4 插值）=====
-        // 即使深度 = 0 也会调用，以保证延迟线连续写入（避免从静默重启时出现口响）
-        tapeWobble.process(buffer);
-    }
+    // ===== 核心音频处理：5 路重采样 pitch shift + 混音 + 声相 + 硬削波 =====
+    pitchEngine.process(buffer);
 
     // 示例波形：抓取主输出的第0通道（已是处理后的信号）
     if (totalNumOutputChannels > 0)
@@ -205,16 +185,21 @@ PuponvstAudioProcessor::EditorState PuponvstAudioProcessor::getEditorState() con
 // 内容包含：5 圆点高度、红蓝射线斜率、正态曲线方差、黄色激光归一化值。
 void PuponvstAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
-    EditorState s = getEditorState();
-    // 即使 Editor 从未打开过，我们也写入当前的默认值（hasValidValues = false 时使用结构体默认值）
+    // 保存 APVTS 状态 + EditorState
     juce::ValueTree tree("PuponState");
-    tree.setProperty("version",       1,                    nullptr);
-    tree.setProperty("rayslopeK",     s.rayslopeK,          nullptr);
-    tree.setProperty("isVerticalRay", s.isVerticalRay,      nullptr);
-    tree.setProperty("sigma",         s.sigma,              nullptr);
-    tree.setProperty("vibratoT",      s.vibratoTVisual,     nullptr);
+    tree.setProperty("version", 1, nullptr);
+    
+    // 保存 APVTS 参数值 (copyState() 返回的就是 ValueTree)
+    juce::ValueTree paramsTree = apvts.copyState();
+    tree.appendChild(paramsTree, nullptr);
+    
+    // 保存 EditorState（用于非参数状态）
+    EditorState s = getEditorState();
+    tree.setProperty("rayslopeK_extra", s.rayslopeK, nullptr);
+    tree.setProperty("isVerticalRay_extra", s.isVerticalRay, nullptr);
+    tree.setProperty("sigma_extra", s.sigma, nullptr);
     for (int i = 0; i < 5; ++i)
-        tree.setProperty("dot" + juce::String(i), s.dotOffsetT[(size_t) i], nullptr);
+        tree.setProperty("dot" + juce::String(i) + "_extra", s.dotOffsetT[(size_t) i], nullptr);
 
     if (auto xml = tree.createXml())
         copyXmlToBinary(*xml, destData);
@@ -224,20 +209,30 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
 {
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
     {
-        if (! xml->hasTagName("PuponState"))
+        if (!xml->hasTagName("PuponState"))
             return;
 
         auto tree = juce::ValueTree::fromXml(*xml);
-        if (! tree.isValid())
+        if (!tree.isValid())
             return;
 
+        // 恢复 APVTS 参数状态
+        if (tree.getNumChildren() > 0)
+        {
+            auto paramsTree = tree.getChild(0);
+            if (paramsTree.hasType("PARAMETERS"))
+            {
+                apvts.replaceState(paramsTree);
+            }
+        }
+
+        // 恢复 EditorState
         EditorState s;
-        s.rayslopeK     = (float) tree.getProperty("rayslopeK",     s.rayslopeK);
-        s.isVerticalRay = (bool)  tree.getProperty("isVerticalRay", s.isVerticalRay);
-        s.sigma         = (float) tree.getProperty("sigma",         s.sigma);
-        s.vibratoTVisual= (float) tree.getProperty("vibratoT",      s.vibratoTVisual);
+        s.rayslopeK     = (float) tree.getProperty("rayslopeK_extra", s.rayslopeK);
+        s.isVerticalRay = (bool)  tree.getProperty("isVerticalRay_extra", s.isVerticalRay);
+        s.sigma         = (float) tree.getProperty("sigma_extra", s.sigma);
         for (int i = 0; i < 5; ++i)
-            s.dotOffsetT[(size_t) i] = (float) tree.getProperty("dot" + juce::String(i),
+            s.dotOffsetT[(size_t) i] = (float) tree.getProperty("dot" + juce::String(i) + "_extra",
                                                                  s.dotOffsetT[(size_t) i]);
         s.hasValidValues = true;
 
@@ -245,11 +240,6 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
             const juce::SpinLock::ScopedLockType sl(editorStateLock);
             editorState = s;
         }
-
-        // vibratoT 也直接同步给音频线程（视觉值 → gamma 映射后的 audio 值）
-        // 与 Editor 的映射保持一致：pow(t, 2.5)
-        const float tAudio = std::pow(juce::jlimit(0.0f, 1.0f, s.vibratoTVisual), 2.5f);
-        setVibratoT(tAudio);
     }
 }
 
@@ -257,4 +247,100 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
 {
     return new PuponvstAudioProcessor();
+}
+
+juce::AudioProcessorValueTreeState::ParameterLayout PuponvstAudioProcessor::createParameterLayout()
+{
+    juce::AudioProcessorValueTreeState::ParameterLayout layout;
+
+    // 红线斜率（红蓝激光控制器）- 范围 [-5, 5]，默认 0
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        ParameterIDs::rayslopeK,
+        "Red-Blue Laser Slope",
+        juce::NormalisableRange<float>(-5.0f, 5.0f, 0.01f),
+        0.0f,
+        juce::AudioParameterFloatAttributes()
+            .withLabel("slope")
+            .withStringFromValueFunction([](float value, int) {
+                return juce::String(value, 2);
+            })
+    ));
+
+    // 垂直射线模式开关 - 默认 false（不垂直）
+    layout.add(std::make_unique<juce::AudioParameterBool>(
+        ParameterIDs::isVerticalRay,
+        "Vertical Ray Mode",
+        false
+    ));
+
+    // 正态分布标准差 - 范围 [0.1, 3.0]，默认 1.0
+    layout.add(std::make_unique<juce::AudioParameterFloat>(
+        ParameterIDs::sigma,
+        "Gaussian Sigma",
+        juce::NormalisableRange<float>(0.1f, 3.0f, 0.01f),
+        1.0f,
+        juce::AudioParameterFloatAttributes()
+            .withLabel("sigma")
+            .withStringFromValueFunction([](float value, int) {
+                return juce::String(value, 2);
+            })
+    ));
+
+    // 5个珍珠圆点位置（归一化高度）- 范围 [0.0, 1.0]，默认 1.0（顶端）
+    for (int i = 0; i < 5; ++i)
+    {
+        juce::String paramID = "dot" + juce::String(i);
+        juce::String paramName = "Pearl Dot " + juce::String(i + 1);
+        
+        layout.add(std::make_unique<juce::AudioParameterFloat>(
+            paramID,
+            paramName,
+            juce::NormalisableRange<float>(0.0f, 1.0f, 0.01f),
+            1.0f,
+            juce::AudioParameterFloatAttributes()
+                .withLabel("gain")
+                .withStringFromValueFunction([](float value, int) {
+                    return juce::String(int(value * 100.0f)) + "%";
+                })
+        ));
+    }
+
+    return layout;
+}
+
+void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, float newValue)
+{
+    // 当宿主自动化参数时，同步更新 EditorState
+    EditorState s = getEditorState();
+    bool stateChanged = false;
+
+    if (parameterID == ParameterIDs::rayslopeK)
+    {
+        s.rayslopeK = newValue;
+        stateChanged = true;
+    }
+    else if (parameterID == ParameterIDs::isVerticalRay)
+    {
+        s.isVerticalRay = (newValue > 0.5f);
+        stateChanged = true;
+    }
+    else if (parameterID == ParameterIDs::sigma)
+    {
+        s.sigma = juce::jlimit(0.1f, 3.0f, newValue);
+        stateChanged = true;
+    }
+    else if (parameterID.startsWith("dot"))
+    {
+        int dotIndex = parameterID.substring(3).getIntValue();
+        if (dotIndex >= 0 && dotIndex < 5)
+        {
+            s.dotOffsetT[dotIndex] = juce::jlimit(0.0f, 1.0f, newValue);
+            stateChanged = true;
+        }
+    }
+
+    if (stateChanged)
+    {
+        setEditorState(s);
+    }
 }

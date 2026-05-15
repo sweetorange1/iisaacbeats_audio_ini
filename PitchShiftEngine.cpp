@@ -12,6 +12,7 @@ PitchShiftEngine::PitchShiftEngine()
     {
         dotGains[(size_t)i].store(0.0f, std::memory_order_relaxed);
         dotPans [(size_t)i].store(0.0f, std::memory_order_relaxed);
+        bandEnabled[(size_t)i].store(true, std::memory_order_relaxed);
     }
 }
 
@@ -45,28 +46,45 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
         {
             auto& s = state[(size_t)b][(size_t)ch];
 
-            s.shifter = std::make_unique<RubberBandLiveShifter>(
-                (size_t)std::llround(sampleRate), /* channels */ 1, rbOptions);
-            s.shifter->setPitchScale(ratio);
+            // 【优化】只为由启用的 band 创建 shifter，禁用 band 释放资源
+            if (bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            {
+                s.shifter = std::make_unique<RubberBandLiveShifter>(
+                    (size_t)std::llround(sampleRate), /* channels */ 1, rbOptions);
+                s.shifter->setPitchScale(ratio);
 
-            s.rbBlockSize = (int)s.shifter->getBlockSize();
-            jassert(s.rbBlockSize > 0);
+                s.rbBlockSize = (int)s.shifter->getBlockSize();
+                jassert(s.rbBlockSize > 0);
 
-            s.inAccum.assign((size_t)s.rbBlockSize, 0.0f);
-            s.inAccumSize = 0;
+                s.inAccum.assign((size_t)s.rbBlockSize, 0.0f);
+                s.inAccumSize = 0;
 
-            s.shiftIn .assign((size_t)s.rbBlockSize, 0.0f);
-            s.shiftOut.assign((size_t)s.rbBlockSize, 0.0f);
+                s.shiftIn .assign((size_t)s.rbBlockSize, 0.0f);
+                s.shiftOut.assign((size_t)s.rbBlockSize, 0.0f);
 
-            // outRing 容量：为最坏情况预留几倍 blockSize + 一次 DAW block 的余量
-            const int cap = s.rbBlockSize * 4 + maxBlockSizePrepared * 2 + 32;
-            s.outRing.assign((size_t)cap, 0.0f);
-            s.outHead = 0;
-            s.outTail = 0;
+                // outRing 容量：为最坏情况预留几倍 blockSize + 一次 DAW block 的余量
+                const int cap = s.rbBlockSize * 4 + maxBlockSizePrepared * 2 + 32;
+                s.outRing.assign((size_t)cap, 0.0f);
+                s.outHead = 0;
+                s.outTail = 0;
 
-            // 记录延迟（五路相同，取任一即可；保守起见取最大）
-            const int lat = (int)s.shifter->getStartDelay();
-            reportedLatency = juce::jmax(reportedLatency, lat);
+                // 记录延迟（五路相同，取任一即可；保守起见取最大）
+                const int lat = (int)s.shifter->getStartDelay();
+                reportedLatency = juce::jmax(reportedLatency, lat);
+            }
+            else
+            {
+                // 禁用状态：释放 shifter 和相关缓冲区以节省资源
+                s.shifter.reset();
+                s.rbBlockSize = 0;
+                s.inAccum.clear();
+                s.inAccumSize = 0;
+                s.shiftIn.clear();
+                s.shiftOut.clear();
+                s.outRing.clear();
+                s.outHead = 0;
+                s.outTail = 0;
+            }
         }
     }
 }
@@ -75,6 +93,10 @@ void PitchShiftEngine::reset()
 {
     for (int b = 0; b < kNumBands; ++b)
     {
+        // 【优化】只 reset 启用的 band
+        if (!bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            continue;
+
         for (int ch = 0; ch < 2; ++ch)
         {
             auto& s = state[(size_t)b][(size_t)ch];
@@ -100,6 +122,26 @@ void PitchShiftEngine::setDotPan(int index, float pan)
 {
     if (index < 0 || index >= kNumBands) return;
     dotPans[(size_t)index].store(juce::jlimit(-1.0f, 1.0f, pan), std::memory_order_relaxed);
+}
+
+void PitchShiftEngine::setBandEnabled(int band, bool enabled)
+{
+    if (band < 0 || band >= kNumBands) return;
+    
+    // 【优化】只在状态真正改变时才更新（避免不必要的 prepare 调用）
+    bool current = bandEnabled[(size_t)band].load(std::memory_order_relaxed);
+    if (current != enabled)
+    {
+        bandEnabled[(size_t)band].store(enabled, std::memory_order_relaxed);
+        // 注意：实际释放/创建 shifter 需要在下次 prepare() 时进行
+        // 这里只设置标志位，由调用者在适当时机调用 prepare()
+    }
+}
+
+bool PitchShiftEngine::getBandEnabled(int band) const
+{
+    if (band < 0 || band >= kNumBands) return false;
+    return bandEnabled[(size_t)band].load(std::memory_order_relaxed);
 }
 
 // 确保 outRing 至少能再写入 extra 个样本（靠前面 shift 腾出空间）
@@ -184,36 +226,35 @@ void PitchShiftEngine::process(juce::AudioBuffer<float>& buffer)
     const int numCh      = juce::jlimit(1, 2, buffer.getNumChannels());
     if (numSamples <= 0) return;
 
-    // ===== 1. 喂入所有 band 所有 ch，并按 rbBlockSize 驱动 LiveShifter =====
-    //
-    // 每路 band 的 pitch ratio 是固定的（在 prepare() 中一次性 setPitchScale），
-    // 这里只负责把整 block 输入推进到对应 shifter 的输出环。
-    //
-    // 颤音"老磁带跑调"效果由独立的 TapeWobble 模块在本引擎之后串联完成，
-    // 不再在 5 路 LiveShifter 内做实时 ratio 调制 —— 这是消除毛刺电流声
-    // 的关键架构改造。
-    //
-    // 注意：先把输入拷一份再写回 buffer，避免读写冲突。
     juce::AudioBuffer<float> inputCopy;
     inputCopy.makeCopyOf(buffer, true);
 
-    for (int b = 0; b < kNumBands; ++b)
-        for (int ch = 0; ch < numCh; ++ch)
-            pumpInputToBand(b, ch, inputCopy.getReadPointer(ch), numSamples);
+    activeBandsCount = 0; // 重置活动band计数器
 
-    // ===== 2. 按 band 取出 numSamples 个输出，做 gain/pan/混音 =====
-    // 这里的 pan 采用"声道间能量转移"模型（保留原立体声信息）：
-    //   pan = 0（白）：  outL = L, outR = R           —— 完全不动
-    //   pan > 0（蓝/向右）：设 p = pan ∈ (0,1]
-    //                    outL = L * (1 - p)
-    //                    outR = R + L * p            —— 左声道的 p 比例搬到右
-    //   pan < 0（红/向左）：设 p = -pan ∈ (0,1]
-    //                    outR = R * (1 - p)
-    //                    outL = L + R * p            —— 右声道的 p 比例搬到左
-    //   pan = ±1：  对侧完全清空，全部并入单边（真正的"纯红/纯蓝"）
-    //
-    // 注意：若输入本身只有单声道（numCh==1），则 R 不存在，我们用 L 代 R，
-    //       此时本算法退化为"原值衰减 + 对侧拷贝"，效果与经典 pan 一致。
+    // 【优化】只处理 gain > 0 的 band（gain=0 时完全跳过，包括输入处理）
+    // 这样当 UI 上把圆点拖到最下端时，CPU 会自动下降
+    for (int b = 0; b < kNumBands; ++b)
+    {
+        // 检查 bandEnabled 标志
+        if (!bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            continue;
+
+        // 【关键优化】检查 gain 是否为 0，如果是则完全跳过该 band 的所有处理
+        const float gain = dotGains[(size_t)b].load(std::memory_order_relaxed);
+        if (gain <= 1.0e-6f)
+            continue;
+
+        // 统计活动band数量（用于调试显示）
+        activeBandsCount++;
+
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            // 额外检查：确保该 band/ch 的 shifter 已创建
+            if (state[(size_t)b][(size_t)ch].shifter)
+                pumpInputToBand(b, ch, inputCopy.getReadPointer(ch), numSamples);
+        }
+    }
+
     static thread_local std::vector<float> accL, accR, tmpL, tmpR;
     if ((int)accL.size() < numSamples) accL.assign((size_t)numSamples, 0.0f);
     else std::fill(accL.begin(), accL.begin() + numSamples, 0.0f);
@@ -224,11 +265,29 @@ void PitchShiftEngine::process(juce::AudioBuffer<float>& buffer)
 
     for (int b = 0; b < kNumBands; ++b)
     {
+        if (!bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            continue;
+
+        // 【优化】额外检查：确保该 band 的 shifter 存在（防止 prepare 时未创建）
+        bool shifterExists = false;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            if (state[(size_t)b][(size_t)ch].shifter)
+            {
+                shifterExists = true;
+                break;
+            }
+        }
+        if (!shifterExists)
+            continue;
+
+        // 这里不需要再检查 gain，因为前面输入处理阶段已经跳过 gain=0 的 band
+        // 能到达这里的 band 都是 gain > 0 的
         const float gain = dotGains[(size_t)b].load(std::memory_order_relaxed);
+        // 防御性检查：如果 gain 仍然是 0，跳过（理论上不会到达这里）
+        if (gain <= 1.0e-6f) continue;
         const float pan  = juce::jlimit(-1.0f, 1.0f,
                                         dotPans[(size_t)b].load(std::memory_order_relaxed));
-
-        // 先把该 band 两声道的 shifted 样本都取出来
         drainFromBand(b, 0, tmpL.data(), numSamples);
         if (numCh >= 2)
             drainFromBand(b, 1, tmpR.data(), numSamples);

@@ -66,8 +66,6 @@ target_sources(Puponvst PRIVATE
   PluginEditor.h
   PitchShiftEngine.cpp
   PitchShiftEngine.h
-  TapeWobble.cpp
-  TapeWobble.h
   # Rubber Band single-file unity build（见官方 single/RubberBandSingle.cpp 说明，
   # 里面已内置 USE_BUILTIN_FFT / USE_BQRESAMPLER / NO_THREADING 等宏）
   ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
@@ -76,17 +74,20 @@ target_sources(Puponvst PRIVATE
 # 针对 Rubber Band 源文件单独设置 NOMINMAX（防止 <windows.h> 的 min/max 宏
 # 污染 std::min / std::max）以及 _USE_MATH_DEFINES（Rubber Band 用了 M_PI 等）。
 # 只作用于该源文件，不影响 JUCE 及本插件其它代码。
+# 
+# 【CPU优化】通过 RUBBERBAND_USE_FASTEST_RESAMPLER 宏将重采样器质量强制设为 Fastest
+# 这会修改 BQResampler::QualityParams 的行为，使 FastestTolerable 也使用 Fastest 的参数
 if(MSVC)
     set_source_files_properties(
         ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
         PROPERTIES
-        COMPILE_DEFINITIONS "NOMINMAX;_USE_MATH_DEFINES;_CRT_SECURE_NO_WARNINGS"
+        COMPILE_DEFINITIONS "NOMINMAX;_USE_MATH_DEFINES;_CRT_SECURE_NO_WARNINGS;RUBBERBAND_USE_FASTEST_RESAMPLER"
     )
 else()
     set_source_files_properties(
         ${rubberband_SOURCE_DIR}/single/RubberBandSingle.cpp
         PROPERTIES
-        COMPILE_DEFINITIONS "_USE_MATH_DEFINES"
+        COMPILE_DEFINITIONS "_USE_MATH_DEFINES;RUBBERBAND_USE_FASTEST_RESAMPLER"
     )
 endif()
 

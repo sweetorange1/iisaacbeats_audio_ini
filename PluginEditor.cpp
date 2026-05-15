@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include "PluginProcessor.h"
 #include "BinaryData.h"
 #include <functional>
 #include <JuceHeader.h>
@@ -37,7 +38,7 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
     titleLabel.setFont(makeAtomicFont(48.0f));
 
     // 副标题：版本 + 网址（字号 20，不加粗不斜体）
-    versionLabel.setText("v0.9.0 iisaacbeats.cn", juce::dontSendNotification);
+    versionLabel.setText("v0.9.1 iisaacbeats.cn", juce::dontSendNotification);
     versionLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.85f));
     versionLabel.setJustificationType(juce::Justification::centredLeft);
     versionLabel.setFont(makeAtomicFont(30.0f));
@@ -78,15 +79,34 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
             isVerticalRay = restored.isVerticalRay;
             sigma         = juce::jlimit(0.1f, 3.0f, restored.sigma);
             dotOffsetT    = restored.dotOffsetT;
-            vibratoT      = juce::jlimit(0.0f, 1.0f, restored.vibratoTVisual);
         }
     }
 
     // 初始化完成后把当前的 gain/pan 推给音频线程（此时已经包含了恢复出的值，如果有的话）
     pushDotParamsToProcessor();
-    // 把当前的颗音控制值（黄线）推给音频线程
-    // 加 gamma 映射：视觉上黄线在 vibratoT 位置，但推给 audio 的是非线性映射后的值（前缓后陟）
-    processor.setVibratoT(mapVibratoVisualToAudio(vibratoT));
+
+    // ===== 从 APVTS 读取参数值（宿主自动化参数 / 加载工程时）=====
+    // APVTS 参数优先级高于 EditorState（参数系统是现代方式）
+    if (auto* rayslopeKParam = processor.getAPVTS().getRawParameterValue(ParameterIDs::rayslopeK))
+    {
+        rayslopeK = rayslopeKParam->load();
+    }
+    if (auto* isVerticalRayParam = processor.getAPVTS().getRawParameterValue(ParameterIDs::isVerticalRay))
+    {
+        isVerticalRay = (isVerticalRayParam->load() > 0.5f);
+    }
+    if (auto* sigmaParam = processor.getAPVTS().getRawParameterValue(ParameterIDs::sigma))
+    {
+        sigma = juce::jlimit(0.1f, 3.0f, sigmaParam->load());
+    }
+    for (int i = 0; i < 5; ++i)
+    {
+        juce::String paramID = "dot" + juce::String(i);
+        if (auto* dotParam = processor.getAPVTS().getRawParameterValue(paramID))
+        {
+            dotOffsetT[i] = juce::jlimit(0.0f, 1.0f, dotParam->load());
+        }
+    }
 
     // ===== 标记初始化完成，从此 push 操作可以正式镜像状态到 Processor =====
     // 之前 setSize() 同步触发的 resized() 会调用 pushDotParamsToProcessor()，但因 initialised=false
@@ -95,6 +115,16 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
     // 此时再做一次 push，让 Processor 的 editorState 与 Editor 当前成员值（含恢复值）保持一致。
     pushDotParamsToProcessor();
 
+    // 添加参数监听器，响应宿主自动化
+    processor.getAPVTS().addParameterListener(ParameterIDs::rayslopeK, this);
+    processor.getAPVTS().addParameterListener(ParameterIDs::isVerticalRay, this);
+    processor.getAPVTS().addParameterListener(ParameterIDs::sigma, this);
+    for (int i = 0; i < 5; ++i)
+    {
+        juce::String paramID = "dot" + juce::String(i);
+        processor.getAPVTS().addParameterListener(paramID, this);
+    }
+
     // 启动动效计时器：约 40 FPS，既能保证丝滑，又不浪费 CPU
     startTimerHz(40);
 }
@@ -102,6 +132,16 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
 PuponvstAudioProcessorEditor::~PuponvstAudioProcessorEditor()
 {
     stopTimer();
+    
+    // 移除参数监听器
+    processor.getAPVTS().removeParameterListener(ParameterIDs::rayslopeK, this);
+    processor.getAPVTS().removeParameterListener(ParameterIDs::isVerticalRay, this);
+    processor.getAPVTS().removeParameterListener(ParameterIDs::sigma, this);
+    for (int i = 0; i < 5; ++i)
+    {
+        juce::String paramID = "dot" + juce::String(i);
+        processor.getAPVTS().removeParameterListener(paramID, this);
+    }
 }
 
 // ===== 动效时钟：每帧采集音频电平 + 推进时间相位 + 触发重绘 =====
@@ -171,6 +211,20 @@ void PuponvstAudioProcessorEditor::paint(juce::Graphics& g)
     // 导航栏边框（极细亮线，像一条微发光 hairline）
     g.setColour(juce::Colour(0x33FFFFFF));
     g.drawLine(0, 60, (float)getWidth(), 60.0f, 1.0f);
+    
+    // ===== 调试信息：显示当前活动的 band 数量 =====
+    // 当 gain=0 的 band 不处理时，这个信息可以验证优化是否生效
+    {
+        const int activeBands = processor.getActiveBandsCount();
+        juce::String debugText = "Active Bands: " + juce::String(activeBands) + " / 5";
+        
+        g.setColour(juce::Colours::white.withAlpha(0.7f));
+        g.setFont(16.0f); // 使用标准字体，避免调用 makeAtomicFont
+        // 显示在导航栏右侧
+        g.drawText(debugText, 
+                   navBar.getRight() - 200, navBar.getY(), 190, navBar.getHeight(),
+                   juce::Justification::centredRight, true);
+    }
     
     // 获取控制区域（统一移除导航栏高度，保持与交互判定一致）
     auto controlArea = getLocalBounds();
@@ -307,107 +361,38 @@ void PuponvstAudioProcessorEditor::paint(juce::Graphics& g)
         const juce::Point<float> dotCenter = getDotCenter(i, controlArea);
         const float dotY = dotCenter.y;
         
-        // 绘制竖直引导线：根据颤音深度与该 band 是否参与颤音，绘制为直线或正弦曲线
-        //   - 中间 band（i==2）：始终为直线（原信号不颤音）
-        //   - 其余 4 路：当 vibratoT 进入颤音区（>= 死区）时，按归一化深度 d ∈ [0,1] 显示正弦波
-        //     振幅最大约 11 px（≈ 列间距的一小部分，避免相邻线相交）
-        //     周期：从 trackTopY-10 到 baseY 之间显示约 2 个完整波形
-        //     相位：来自 audio 线程同步过来的 vibPhase01，全 4 路同相
-        //   黄线 t < 0.15 时（depth=0）退化成与原来一致的纯直线
-        const float vibDepth = processor.getVibDepthNorm();   // [0,1]
-        const float vibPh    = processor.getVibPhase01();     // [0,1)
-        const bool  isMiddle = (i == 2);
-        const bool  drawSine = (!isMiddle) && (vibDepth > 1.0e-3f);
+        // 绘制竖直引导线：始终绘制为直线
+        const float yTop = trackTopY - 10.0f;
+        const float yBot = baseY;
+        
+        juce::ColourGradient vg(juce::Colours::white.withAlpha(0.45f), xPos, yTop,
+                                juce::Colours::white.withAlpha(0.00f), xPos, yBot, false);
+        g.setGradientFill(vg);
+        g.drawLine(xPos, yTop, xPos, yBot, 1.0f);
 
-        // 该路 band 当前的瞬时偏移（用于"弱光爬动"位置）：
-        //   sin(2π * vibPh) 给出 [-1, 1]
-        //   左两路（band 0/1）和右两路（band 3/4）对每路做同相显示就够；
-        //   "爬动光"代表当前跑调位置 → 沿竖直线由 baseY 向 trackTopY 间映射
-        const float sinNow = std::sin(2.0f * juce::MathConstants<float>::pi * vibPh);
-        // 振幅（像素）：以列间距的 ~28% 为上限，避免相邻线"打架"
-        const float colSpacing = controlArea.getWidth() * (kDotRelativePositions[1] - kDotRelativePositions[0]);
-        const float maxAmpPx   = juce::jmin(18.0f, colSpacing * 0.28f);
-        const float ampPx      = drawSine ? (maxAmpPx * vibDepth) : 0.0f;
-
-        if (drawSine)
-        {
-            // 正弦波 path：按 1px 步长绘制，垂直方向覆盖 [trackTopY-10, baseY]
-            // x(y) = xPos + ampPx * sin(2π * (yNorm * cycles) + phase)
-            //   yNorm = (baseY - y) / (baseY - trackTopY+10)  // 0=底，1=顶
-            //   cycles = 2.5（视觉上有韵律，又不会太密）
-            const float yTop = trackTopY - 10.0f;
-            const float yBot = baseY;
-            const float span = juce::jmax(1.0f, yBot - yTop);
-            const float cycles = 2.5f;
-            const float phRad  = 2.0f * juce::MathConstants<float>::pi * vibPh;
-
-            juce::Path wavePath;
-            const int steps = juce::jmax(8, (int)span);
-            for (int s = 0; s <= steps; ++s)
-            {
-                const float y = yBot - (float)s * span / (float)steps;
-                const float yNorm = (yBot - y) / span;
-                const float dx = ampPx * std::sin(2.0f * juce::MathConstants<float>::pi * yNorm * cycles + phRad);
-                const float x = xPos + dx;
-                if (s == 0) wavePath.startNewSubPath(x, y);
-                else        wavePath.lineTo(x, y);
-            }
-            // 多层描边：暗外晕 + 高亮内芯，与正态曲线灯条风格保持一致
-            g.setColour(juce::Colours::white.withAlpha(0.10f + 0.10f * vibDepth));
-            g.strokePath(wavePath, juce::PathStrokeType(2.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-            g.setColour(juce::Colours::white.withAlpha(0.55f));
-            g.strokePath(wavePath, juce::PathStrokeType(1.0f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        }
-        else
-        {
-            juce::ColourGradient vg(juce::Colours::white.withAlpha(0.45f), xPos, trackTopY - 10.0f,
-                                    juce::Colours::white.withAlpha(0.00f), xPos, baseY, false);
-            g.setGradientFill(vg);
-            g.drawLine(xPos, trackTopY - 10.0f, xPos, baseY, 1.0f);
-        }
-
-        // ===== 弱光爬动光：只要不是中间路（i!=2），无论是否有颤音都持续显示 =====
-        //   - vibDepth=0 时：sinNow 仍按相位摆动，但 ampPx=0 → 光点贴在直线 X=xPos 上，
-        //     随相位垂直上下游走，呈现"安静地呼吸"的视觉
-        //   - vibDepth>0 时：光点沿正弦波线游走，振幅随深度增大
-        if (! isMiddle)
+        // ===== 弱光爬动光：沿竖直线上下游走 =====
         {
             const float yTop = trackTopY - 10.0f;
             const float yBot = baseY;
             const float span = juce::jmax(1.0f, yBot - yTop);
-            const float cycles = 2.5f;
-            const float phRad  = 2.0f * juce::MathConstants<float>::pi * vibPh;
-
-            // 弱光爬动：当前颤音瞬时偏移 sinNow ∈ [-1,1] 决定光点位置（沿 y 方向）
-            //   pos01 = 0.5 + 0.5 * sinNow  → 0=底，1=顶
-            //   左两路（i=0,1，半音为负）取反：当下偏向负半音 → 光点低；正半音 → 光点高
-            //   为了直觉一致：让光点位置始终代表"当前正/负偏移"——所有路同相向上下移动
-            float posNorm = 0.5f + 0.5f * sinNow;
-            if (i < 2) posNorm = 1.0f - posNorm; // 左侧两路反相，使视觉与"哪边在升、哪边在降"对应
+            
+            // 弱光爬动：基于动画相位产生呼吸感
+            float posNorm = 0.5f + 0.3f * std::sin(animPhase * 1.5f + (float)i * 0.7f);
             const float yLight = yBot - posNorm * span;
-            // 在波形 path 上对应 y 处的 x（让光点贴在波线/直线上）
-            const float yNormLight = (yBot - yLight) / span;
-            const float xLight = xPos + ampPx * std::sin(2.0f * juce::MathConstants<float>::pi * yNormLight * cycles + phRad);
+            const float xLight = xPos;
 
-            // 弱光：双层柔光晕（基础亮度始终保留，让 vibDepth=0 时也能看到一颗安静的光球）
-            const float glowR = 6.0f + 4.0f * vibDepth + 3.0f * audioLevel;
-            const float baseAlpha = 0.55f + 0.30f * vibDepth; // depth=0 → 0.55；depth=1 → 0.85
+            // 弱光：双层柔光晕
+            const float glowR = 6.0f + 3.0f * audioLevel;
+            const float baseAlpha = 0.55f;
             juce::ColourGradient glow(juce::Colour(0xFFFFE9A8).withAlpha(baseAlpha), xLight, yLight,
                                       juce::Colour(0x00FFE9A8),                     xLight + glowR, yLight, true);
             glow.addColour(0.4, juce::Colour(0xFFFFE9A8).withAlpha(baseAlpha * 0.45f));
             g.setGradientFill(glow);
             g.fillEllipse(xLight - glowR, yLight - glowR, glowR * 2.0f, glowR * 2.0f);
             // 中心小亮核
-            g.setColour(juce::Colours::white.withAlpha(0.85f + 0.10f * vibDepth));
-            const float coreR = 1.4f + 0.8f * vibDepth;
+            g.setColour(juce::Colours::white.withAlpha(0.85f));
+            const float coreR = 1.4f;
             g.fillEllipse(xLight - coreR, yLight - coreR, coreR * 2.0f, coreR * 2.0f);
-        }
-        else
-        {
-            juce::ColourGradient vg(juce::Colours::white.withAlpha(0.45f), xPos, trackTopY - 10.0f,
-                                    juce::Colours::white.withAlpha(0.00f), xPos, baseY, false);
-            g.setGradientFill(vg);
-            g.drawLine(xPos, baseY, xPos, trackTopY - 10.0f, 1.0f);
         }
         
         // === 计算红/蓝射线与该竖直线的交点高度，得到染色 ===
@@ -696,81 +681,6 @@ void PuponvstAudioProcessorEditor::paint(juce::Graphics& g)
         g.fillEllipse(bottomCenter.x - dotR, bottomCenter.y - dotR, dotR * 2.0f, dotR * 2.0f);
     }
 
-    // ===== 黄色颤音控制横线 =====
-    // 一根横贯整个控制区的黄色激光线；
-    //   - vibratoT < 0.15（死区）：纯直线（不颤音，视觉与功能保持一致）
-    //   - vibratoT ∈ [0.15, 1]：随归一化深度 d 逐渐变成正弦波；振幅、波长都随 d 增长
-    //   - 高度同时决定 yLine（控制器的位置）：底部=不颤，顶部=最大颤
-    {
-        const float yLine = getReverbLineY(controlArea);
-        const float xL = (float)controlArea.getX();
-        const float xR = (float)controlArea.getRight();
-        const float spanX = juce::jmax(1.0f, xR - xL);
-
-        // 归一化颤音深度（与 audio 线程一致）
-        // 死区改为 0：t 直接作为归一化深度，0~0.15 也会有非常微弱的颤音（配合 gamma=2.5 后端非线性，前段几乎听不出，符合"前缓后陡"）
-        const float t        = juce::jlimit(0.0f, 1.0f, vibratoT);
-        const float depthD   = t;
-        const bool  showWave = (depthD > 1.0e-3f);
-
-        const float lineBreath = 0.90f + 0.10f * std::sin(animPhase * 1.8f);
-        const float lineAudio  = 1.0f + 0.35f * audioLevel;
-        // 亮度依然随 t 提升，整体偏亮
-        const float brightness = (0.50f + 0.50f * t) * lineBreath * lineAudio;
-
-        const juce::Colour pureYellow (0xFFFFD23B);
-        const juce::Colour softYellow (0xFFFFE880);
-
-        // ----- 构建当前激光线 path：直线 / 正弦波统一用 path -----
-        juce::Path linePath;
-        if (! showWave)
-        {
-            linePath.startNewSubPath(xL, yLine);
-            linePath.lineTo(xR, yLine);
-        }
-        else
-        {
-            // 振幅：随深度从 0 → 20px（硬上限，防止波峰超出控制区）
-            //   黄线 Y 由 vibratoT 决定的最高位置距控制区顶 20px，振幅再 ≤ 20px，正好不会越界。
-            const float maxAmp = 20.0f;
-            const float ampPx  = maxAmp * depthD;
-            // 波长：随深度从"很短的细密波"过渡到"宽阔的舒展波"——增强可读性
-            //   d=0+ → 短波（密集），d=1 → 长波（舒展）。这里用线性插值
-            const float minWavelength = juce::jmax(60.0f, spanX * 0.10f);
-            const float maxWavelength = juce::jmin(spanX * 0.45f, 360.0f);
-            const float wavelength = juce::jmap(depthD, minWavelength, maxWavelength);
-            // 同步音频相位：UI 看到的左右"行进"
-            const float phRad = 2.0f * juce::MathConstants<float>::pi * processor.getVibPhase01();
-
-            const int   steps = juce::jmax(64, (int)spanX);
-            for (int s = 0; s <= steps; ++s)
-            {
-                const float x = xL + (float)s * spanX / (float)steps;
-                const float xLocal = (x - xL);
-                const float dy = ampPx * std::sin(2.0f * juce::MathConstants<float>::pi * (xLocal / wavelength) + phRad);
-                const float y = yLine + dy;
-                if (s == 0) linePath.startNewSubPath(x, y);
-                else        linePath.lineTo(x, y);
-            }
-        }
-
-        // ----- 多层 stroke 描边模拟激光辉光：从粗暗到细亮 -----
-        struct GlowStroke { float w; float alpha; juce::Colour col; };
-        const GlowStroke strokes[] = {
-            { 16.0f, 0.10f * brightness, pureYellow },
-            {  9.0f, 0.22f * brightness, pureYellow },
-            {  4.5f, 0.55f * brightness, softYellow },
-            {  1.6f, 1.00f,               juce::Colours::white.interpolatedWith(pureYellow, 0.25f) }
-        };
-        for (const auto& st : strokes)
-        {
-            g.setColour(st.col.withAlpha(juce::jlimit(0.0f, 1.0f, st.alpha)));
-            g.strokePath(linePath, juce::PathStrokeType(st.w, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
-        }
-
-        juce::ignoreUnused(softYellow);
-    }
-
     // ===== 最上层：圆点本体（在所有激光绘制完成后执行）=====
     // 之前在主循环里已把每个圆点的"halo + 球体 + 活跃环"打包成 lambda，
     // 这里按顺序执行，使圆点视觉位于红/蓝/黄三道激光之上。
@@ -799,7 +709,6 @@ void PuponvstAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
     const float dotHitRadius = 14.0f;         // 圆点命中半径（圆点半径 12.5 + 余量）
     const float normalCurveThreshold = 12.0f; // 正态曲线容差
     const float rayThreshold = 8.0f;          // 射线容差
-    const float reverbLineThreshold = 10.0f;  // 黄色混响横线的命中容差（像素）
     
     // ========== 优先级 1: 检测5个圆点（体积大，需优先于曲线/射线） ==========
     for (int i = 0; i < (int)kDotRelativePositions.size(); ++i)
@@ -812,22 +721,7 @@ void PuponvstAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
         }
     }
 
-    // ========== 优先级 2: 黄色混响横线 ==========
-    // 贯穿整个控制区水平方向，只需判定鼠标 y 与线 y 的距离。
-    // 阈值：基础容差 + 当前正弦振幅（黄线变成波后振幅变大，判定区也随之变大，
-    // 避免波峰/波谷处点击穿过黄线）
-    {
-        const float yLine    = getReverbLineY(controlArea);
-        const float waveAmp  = getReverbWaveAmplitudePx(controlArea);
-        const float dynThresh = reverbLineThreshold + waveAmp;
-        if (std::abs(mousePos.y - yLine) <= dynThresh)
-        {
-            isDraggingReverbLine = true;
-            return;
-        }
-    }
-
-    // ========== 优先级 3: 检测正态分布曲线 ==========
+    // ========== 优先级 2: 检测正态分布曲线 ==========
     float distToCurve = distanceToNormalCurve(mousePos, controlArea);
     
     if (distToCurve <= normalCurveThreshold)
@@ -865,7 +759,7 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
     
     // 如果没有命中任何可拖动项，mouseDown中没有设置拖动状态，这里直接忽略
     if (!isDraggingNormalCurve && !isDraggingRedLine && !isDraggingBlueLine
-        && draggingDotIndex < 0 && !isDraggingReverbLine)
+        && draggingDotIndex < 0)
         return;
     
     juce::Point<float> mousePos = event.position;
@@ -874,36 +768,7 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
     mousePos.x = juce::jlimit<float>((float)controlArea.getX(), (float)controlArea.getRight(), mousePos.x);
     mousePos.y = juce::jlimit<float>((float)controlArea.getY(), (float)controlArea.getBottom(), mousePos.y);
     
-    // ========== 0a. 处理黄色混响横线拖动 ==========
-    if (isDraggingReverbLine)
-    {
-        const float topY    = (float)controlArea.getY();
-        const float bottomY = (float)controlArea.getBottom();
-        const float h       = bottomY - topY;
-        if (h > 1e-3f)
-        {
-            float t = (bottomY - mousePos.y) / h; // 向上为 1，底部为 0
-        vibratoT = juce::jlimit(0.0f, 1.0f, t);
-        }
-        // 推送给 audio 的是经过 gamma 映射的值（前缓后陟），视觉 Y 位置仍按 vibratoT 线性显示
-        processor.setVibratoT(mapVibratoVisualToAudio(vibratoT));
-
-        // 同步整套 UI 镜像（让黄线拖动也即时进入宿主存档）
-        {
-            PuponvstAudioProcessor::EditorState s;
-            s.rayslopeK     = rayslopeK;
-            s.isVerticalRay = isVerticalRay;
-            s.sigma         = sigma;
-            s.dotOffsetT    = dotOffsetT;
-            s.vibratoTVisual= vibratoT;
-            s.hasValidValues= true;
-            processor.setEditorState(s);
-        }
-        repaint();
-        return;
-    }
-
-    // ========== 0. 处理圆点拖动（按组等比联动） ==========
+    // ========== 1. 处理正态曲线拖动 ==========
     if (draggingDotIndex >= 0)
     {
         const int i = draggingDotIndex;
@@ -923,16 +788,29 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
         if (i == 2)
         {
             dotOffsetT[2] = t;
+            // 同步更新 APVTS 参数
+            if (auto* param = processor.getAPVTS().getParameter("dot2"))
+                param->setValueNotifyingHost(t);
         }
         else if (i == 0 || i == 1)
         {
             dotOffsetT[0] = t;
             dotOffsetT[1] = t;
+            // 同步更新 APVTS 参数
+            if (auto* param0 = processor.getAPVTS().getParameter("dot0"))
+                param0->setValueNotifyingHost(t);
+            if (auto* param1 = processor.getAPVTS().getParameter("dot1"))
+                param1->setValueNotifyingHost(t);
         }
         else // i == 3 || i == 4
         {
             dotOffsetT[3] = t;
             dotOffsetT[4] = t;
+            // 同步更新 APVTS 参数
+            if (auto* param3 = processor.getAPVTS().getParameter("dot3"))
+                param3->setValueNotifyingHost(t);
+            if (auto* param4 = processor.getAPVTS().getParameter("dot4"))
+                param4->setValueNotifyingHost(t);
         }
         
         pushDotParamsToProcessor();
@@ -962,12 +840,15 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
             {
                 float newSigma = std::abs(normalizedX) / std::sqrt(logValue);
                 sigma = juce::jlimit(0.1f, 3.0f, newSigma);
+                // 同步更新 APVTS 参数
+                if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::sigma))
+                    param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (sigma - 0.1f) / (3.0f - 0.1f)));
             }
         }
         
         // sigma 变了 → 各圆点轨道顶端变了 → 记录的 dotOffsetT 对应的实际高度也变
         // gain 是 dotOffsetT，本身不变；pan 也不依赖 sigma，所以严格来说无需同步
-        // 但为了保留 “屏幕显示 ⇔ 音频输出一致” 的语义，统一推一次
+        // 但为了保留 "屏幕显示 ⇔ 音频输出一致" 的语义，统一推一次
         pushDotParamsToProcessor();
         repaint();
     }
@@ -987,6 +868,12 @@ void PuponvstAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
         rayslopeK = k;
         isVerticalRay = false; // 永不允许垂直射线
         
+        // 同步更新 APVTS 参数
+        if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::rayslopeK))
+            param->setValueNotifyingHost(juce::jlimit(0.0f, 1.0f, (rayslopeK + 5.0f) / 10.0f));
+        if (auto* param = processor.getAPVTS().getParameter(ParameterIDs::isVerticalRay))
+            param->setValueNotifyingHost(0.0f); // false
+        
         // 射线斜率变了 → 每个圆点的染色进度变了 → pan 变了
         pushDotParamsToProcessor();
         repaint();
@@ -998,7 +885,6 @@ void PuponvstAudioProcessorEditor::mouseUp(const juce::MouseEvent&)
     isDraggingRedLine = false;
     isDraggingBlueLine = false;
     isDraggingNormalCurve = false;
-    isDraggingReverbLine = false;
     const bool wasDraggingDot = (draggingDotIndex >= 0);
     draggingDotIndex = -1;
     if (wasDraggingDot)
@@ -1096,10 +982,39 @@ juce::Point<float> PuponvstAudioProcessorEditor::calculateRayEndBySlope(float k,
     if (isVertical)
         return juce::Point<float>(originX, top);
     
-    // 2) 水平情况（k == 0）——理论上射线退化，不应进入该分支；但为安全起见返回左/右边界
-    //    此时认为射线"平行"于底边，选择一个合理的默认端点（右边界底部）
+    // 2) 水平情况（k == 0 或接近 0）
+    //    需要根据 k 的"方向意图"来决定射线朝向：
+    //    - k 原本应该 > 0（红线斜率为正或蓝线斜率为负取反后）→ 指向右边界
+    //    - k 原本应该 < 0（红线斜率为负或蓝线斜率为正取反后）→ 指向左边界
+    //    由于浮点数 +0 == -0，无法通过 signbit 区分，因此：
+    //    当 |k| 极小时，我们检查 k 是否"应该"为正或负——
+    //    实际上，调用约定保证了：红线用 k，蓝线用 -k。
+    //    当两线都水平时，我们希望红线指向左、蓝线指向右（对称）。
+    //    但更直观的做法是：水平时，红线向左、蓝线向右（因为红左蓝右是默认状态）。
+    //    然而这里无法知道调用者是谁，所以采用更简单的方法：
+    //    当 k 接近 0 时，返回一个"中性"的终点——两个边界的中点底部，
+    //    但这样两条线还是会重合...
+    //
+    //    最终方案：修改函数签名，增加 directionHint 参数？
+    //    不，更简单的方案是：当 k 接近 0 时，根据 k 的"原始方向"返回不同值。
+    //    由于无法区分 +0 和 -0，我们在调用处（paint 和 mouseDown 中）
+    //    传入一个带有方向信息的极小非零值。
+    //    
+    //    但为了保持函数封装完整性，这里做一个简单处理：
+    //    当 k 接近 0 时，如果 k > -1e-6f（即 k 为 +0 或很小的正数），返回右边界；
+    //    如果 k < 1e-6f（即 k 为 -0 或很小的负数），返回左边界。
+    //    这样 k == 0 时，两个判断都满足... 还是不行。
+    //
+    //    【最终正确方案】：当 k 的绝对值极小时，根据 k 的符号位来决定方向。
+    //    利用 std::signbit 可以区分 +0.0 和 -0.0！
     if (std::abs(k) < 1e-6f)
-        return juce::Point<float>(right, originY);
+    {
+        // std::signbit 可以区分 +0.0 和 -0.0
+        if (std::signbit(k))
+            return juce::Point<float>(left, originY);  // k = -0 → 指向左边界（蓝线）
+        else
+            return juce::Point<float>(right, originY); // k = +0 → 指向右边界（红线）
+    }
     
     // 数学坐标系下：射线从原点 (0,0) 沿方向 (dx, dy_up = k * dx) 出发
     // 要求 dy_up > 0 (向上) => 若 k > 0 则 dx > 0（右上方向），若 k < 0 则 dx < 0（左上方向）
@@ -1282,11 +1197,10 @@ void PuponvstAudioProcessorEditor::pushDotParamsToProcessor()
 
     // ===== 把整套 UI 控制状态同步给 Processor（用于宿主存档/恢复） =====
     // 任何会触发本函数的交互（圆点 / 射线 / 正态曲线 / resize）都会顺带把状态镜像更新一份。
-    // vibratoT 拖动不经过本函数，单独在拖动处显式调用 setEditorState（见 mouseDrag）。
     //
     // 关键保护：构造函数完成前（initialised=false）跳过此步！
     // 因为 setSize() 会同步触发 resized() → 此函数 → 如果此时把默认值（rayslopeK=0、
-    // sigma=1、dotOffsetT=全1、vibratoT=0.05）镜像给 Processor，就会覆盖掉宿主刚刚通过
+    // sigma=1、dotOffsetT=全1）镜像给 Processor，就会覆盖掉宿主刚刚通过
     // setStateInformation 恢复出的真存档（或上次 Editor 关闭时残留的最后状态）。
     if (initialised)
     {
@@ -1295,44 +1209,9 @@ void PuponvstAudioProcessorEditor::pushDotParamsToProcessor()
         s.isVerticalRay = isVerticalRay;
         s.sigma         = sigma;
         s.dotOffsetT    = dotOffsetT;
-        s.vibratoTVisual= vibratoT;
         s.hasValidValues= true;
         processor.setEditorState(s);
     }
-}
-
-    // 黄色颗音横线的屏幕 Y 坐标
-    // vibratoT = 0 → 控制区底部；vibratoT = 1 → 控制区顶部上方 20px 处（为正弦波振幅预留空间，防止越界到抬头区）
-    float PuponvstAudioProcessorEditor::getReverbLineY(const juce::Rectangle<int>& controlArea) const
-{
-    const float topMargin = 20.0f;                              // 顶部预留边距
-    const float topY    = (float)controlArea.getY() + topMargin; // 上边界：控制区顶 + 20px
-    const float bottomY = (float)controlArea.getBottom();
-    const float t = juce::jlimit(0.0f, 1.0f, vibratoT);
-    return bottomY + t * (topY - bottomY); // t=0 → bottom, t=1 → 顶部下方 20px
-}
-
-// 黄线当前的正弦振幅（像素）—— 与 paint() 里的公式完全一致
-// 主要用于 mouseDown 时让命中区随振幅一起变大，用户点在波峰/波谷外侧也能拖动
-float PuponvstAudioProcessorEditor::getReverbWaveAmplitudePx(const juce::Rectangle<int>& controlArea) const
-{
-    juce::ignoreUnused(controlArea);
-    const float t      = juce::jlimit(0.0f, 1.0f, vibratoT);
-    const float depthD = t;            // 去除死区：振幅随 t 从 0 起始
-    if (depthD <= 1.0e-3f) return 0.0f;
-    const float maxAmp = 20.0f;        // 硬上限 20px，与 paint 中保持一致
-    return maxAmp * depthD;
-}
-
-// 视觉 t → audio t 的映射（前缓后陟）
-//   去除死区：全区间都用 gamma=2.5 的幂曲线重新映射。
-//   这样 0~0.15 会产生极微弱的颤音（近似 ≤ 1% 强度），体验上"护住耳机就能听出一点点动态"但不会明显跳调。
-//   拖动中间位置仅 ~18% 强度；拖到 80% 位置 ~57%；最后 20% 身位是强烈的"是骡"。
-float PuponvstAudioProcessorEditor::mapVibratoVisualToAudio(float tVisual) noexcept
-{
-    tVisual = juce::jlimit(0.0f, 1.0f, tVisual);
-    constexpr float kGamma = 2.5f;
-    return std::pow(tVisual, kGamma);
 }
 
 void PuponvstAudioProcessorEditor::resized()
@@ -1367,4 +1246,42 @@ void PuponvstAudioProcessorEditor::resized()
     // 窗口尺寸变化 → 控制区高度变 → 射线与竖直线交点的屏幕 y 变 → pan 有可能有极微的重新量化误差
     // 为保持 UI 与音频状态绝对一致，同步一次
     pushDotParamsToProcessor();
+}
+
+// ===== AudioProcessorValueTreeState::Listener 回调 =====
+// 当宿主自动化参数时，更新 UI 成员并触发重绘
+void PuponvstAudioProcessorEditor::parameterChanged(const juce::String& parameterID, float newValue)
+{
+    bool needsRepaint = false;
+
+    if (parameterID == ParameterIDs::rayslopeK)
+    {
+        rayslopeK = newValue;
+        needsRepaint = true;
+    }
+    else if (parameterID == ParameterIDs::isVerticalRay)
+    {
+        isVerticalRay = (newValue > 0.5f);
+        needsRepaint = true;
+    }
+    else if (parameterID == ParameterIDs::sigma)
+    {
+        sigma = juce::jlimit(0.1f, 3.0f, newValue);
+        needsRepaint = true;
+    }
+    else if (parameterID.startsWith("dot"))
+    {
+        int dotIndex = parameterID.substring(3).getIntValue();
+        if (dotIndex >= 0 && dotIndex < 5)
+        {
+            dotOffsetT[dotIndex] = juce::jlimit(0.0f, 1.0f, newValue);
+            needsRepaint = true;
+        }
+    }
+
+    if (needsRepaint)
+    {
+        pushDotParamsToProcessor();
+        repaint();
+    }
 }

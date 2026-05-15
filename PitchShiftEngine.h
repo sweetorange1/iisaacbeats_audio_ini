@@ -57,6 +57,13 @@ public:
     void setDotGain(int index, float gain);
     void setDotPan (int index, float pan);
 
+    // 启用/禁用每个band
+    void setBandEnabled(int band, bool enabled);
+    bool getBandEnabled(int band) const;
+
+    // 获取当前活动的band数量（用于调试：gain > 0 的 band 数量）
+    int getActiveBandsCount() const noexcept { return activeBandsCount.load(std::memory_order_relaxed); }
+
     // 供 PluginProcessor 上报给 DAW 做延迟补偿
     int  getLatencySamples() const noexcept { return reportedLatency; }
 
@@ -91,6 +98,12 @@ private:
     // UI 参数
     std::array<std::atomic<float>, kNumBands> dotGains;
     std::array<std::atomic<float>, kNumBands> dotPans;
+
+    // 启用/禁用每个band
+    std::array<std::atomic<bool>, kNumBands> bandEnabled;
+
+    // 当前活动的band数量（gain > 0 的band数量，用于调试显示）
+    mutable std::atomic<int> activeBandsCount { 0 };
 
     // 辅助：
     // 把 n 个输入样本喂入某 band/ch，内部按 rbBlockSize 调用 shift()，
