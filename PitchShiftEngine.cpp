@@ -69,7 +69,9 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
                 s.outTail = 0;
 
                 // 记录延迟（五路相同，取任一即可；保守起见取最大）
-                const int lat = (int)s.shifter->getStartDelay();
+                // 注意：总延迟 = RubberBand内部延迟 + 输入缓冲延迟(rbBlockSize)
+                // 输入需要累积 rbBlockSize 个样本才能调用 shift()，这部分延迟必须报告给宿主
+                const int lat = (int)s.shifter->getStartDelay() + s.rbBlockSize;
                 reportedLatency = juce::jmax(reportedLatency, lat);
             }
             else
