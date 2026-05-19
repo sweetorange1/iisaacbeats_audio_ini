@@ -7,7 +7,7 @@
 // ===== 参数ID定义（供 Processor 和 Editor 共用）=====
 namespace ParameterIDs
 {
-    static const juce::String rayslopeK     = "rayslopeK";
+    static const juce::String redRayClockwiseAngle = "redRayClockwiseAngle";
     static const juce::String isVerticalRay = "isVerticalRay";
     static const juce::String sigma          = "sigma";
     static const juce::String filterCenterSt = "filterCenterSt";
@@ -69,13 +69,14 @@ public:
     //   - 新 Editor 构造时调用 getEditorState(...) 回填到自己的成员
     struct EditorState
     {
-        // 蓝线角度（度）：0° = 水平向左，90° = 垂直向上，180° = 水平向右
+        // 蓝线角度（度，数学坐标）：0° = 水平向右，90° = 垂直向上，180° = 水平向左
         // 红线角度 = 180° - blueAngleDeg（左右对称）
         float blueAngleDeg = 90.0f;  // 默认垂直向上
-        
-        // 红线斜率（数学坐标系，Y 向上），由 blueAngleDeg 计算得出
-        // 保留用于音频处理中的 pan 计算
-        float rayslopeK    = 0.0f;
+
+        // 红线顺时针角度（以水平向左为 0°）：
+        // 0° = 水平向左，90° = 垂直向上，180° = 水平向右
+        // 与 blueAngleDeg 数值等价（redClockwise = blueAngleDeg）
+        float redRayClockwiseDeg = 90.0f;
         bool  isVerticalRay = false;
         // 正态曲线方差（标准差）
         float sigma        = 2.70f;

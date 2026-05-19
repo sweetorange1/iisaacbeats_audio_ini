@@ -67,7 +67,7 @@ endif()
 juce_add_plugin(
         Puponvst
         PRODUCT_NAME "Pupon"
-        VERSION 0.1.0
+        VERSION 0.9.8
         COMPANY_NAME "iisaacbeas.cn"
         BUNDLE_ID "cn.iisaacbeas.Pupon"
         PLUGIN_MANUFACTURER_CODE Pupo

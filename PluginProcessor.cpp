@@ -15,7 +15,7 @@ PuponvstAudioProcessor::PuponvstAudioProcessor()
       apvts(*this, nullptr, "PARAMETERS", createParameterLayout())
 {
     // 添加参数变化监听
-    apvts.addParameterListener(ParameterIDs::rayslopeK, this);
+    apvts.addParameterListener(ParameterIDs::redRayClockwiseAngle, this);
     apvts.addParameterListener(ParameterIDs::sigma, this);
     apvts.addParameterListener(ParameterIDs::filterCenterSt, this);
     apvts.addParameterListener(ParameterIDs::filterWidthSt, this);
@@ -205,7 +205,7 @@ PuponvstAudioProcessor::EditorState PuponvstAudioProcessor::getEditorState() con
 
 // ===== 状态序列化（保存到宿主工程）=====
 // 用 ValueTree + XML 文本序列化，向后兼容（未来加字段时旧版工程可读）。
-// 内容包含：5 圆点高度、红蓝射线斜率、正态曲线方差、黄色激光归一化值。
+// 内容包含：5 圆点高度、红蓝射线角度、正态曲线方差、黄色激光归一化值。
 void PuponvstAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 {
     // 保存 APVTS 状态 + EditorState
@@ -219,6 +219,7 @@ void PuponvstAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
     // 保存 EditorState（用于非参数状态）
     EditorState s = getEditorState();
     tree.setProperty("blueAngleDeg_extra", s.blueAngleDeg, nullptr);
+    tree.setProperty("redRayClockwiseDeg_extra", s.redRayClockwiseDeg, nullptr);
     tree.setProperty("sigma_extra", s.sigma, nullptr);
     for (int i = 0; i < 5; ++i)
     {
@@ -254,22 +255,7 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
         // 恢复 EditorState
         EditorState s;
         s.blueAngleDeg  = (float) tree.getProperty("blueAngleDeg_extra", s.blueAngleDeg);
-        // 从 blueAngleDeg 计算 rayslopeK
-        {
-            float redAngleDeg = 180.0f - s.blueAngleDeg;
-            float redAngleRad = redAngleDeg * (juce::MathConstants<float>::pi / 180.0f);
-            float verticalRad = 90.0f * (juce::MathConstants<float>::pi / 180.0f);
-            float angleDiff = redAngleRad - verticalRad;
-            constexpr float kMaxSlope = 1.0e4f;
-            if (std::abs(angleDiff) < 0.0001f)
-                s.rayslopeK = 0.0f;
-            else if (angleDiff > juce::MathConstants<float>::halfPi - 0.01f)
-                s.rayslopeK = -kMaxSlope;
-            else if (angleDiff < -juce::MathConstants<float>::halfPi + 0.01f)
-                s.rayslopeK = kMaxSlope;
-            else
-                s.rayslopeK = std::tan(angleDiff);
-        }
+        s.redRayClockwiseDeg = (float) tree.getProperty("redRayClockwiseDeg_extra", s.blueAngleDeg);
         s.sigma         = (float) tree.getProperty("sigma_extra", s.sigma);
         for (int i = 0; i < 5; ++i)
         {
@@ -284,6 +270,10 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
             const juce::SpinLock::ScopedLockType sl(editorStateLock);
             editorState = s;
         }
+
+        // 兼容参数重命名：无论旧工程是否包含新 APVTS ID，都以恢复出的角度回写当前参数。
+        if (auto* angleParam = apvts.getParameter(ParameterIDs::redRayClockwiseAngle))
+            angleParam->setValue(juce::jlimit(0.0f, 1.0f, s.redRayClockwiseDeg / 180.0f));
     }
 }
 
@@ -297,35 +287,31 @@ juce::AudioProcessorValueTreeState::ParameterLayout PuponvstAudioProcessor::crea
 {
     juce::AudioProcessorValueTreeState::ParameterLayout layout;
 
-    // 红线斜率（红蓝激光控制器）- 归一化范围 [0, 1]，默认 0.25 (45°)
-    // 宿主参数 0 → 蓝线向右；0.25 → 蓝线45°右上；0.5 → 蓝线垂直向上；1 → 蓝线向左
+    // 红线顺时针角度（红蓝激光控制器）- 归一化范围 [0, 1]，默认 0.25 (45°)
+    // 角度定义：以红线水平向左为 0°，顺时针旋转到水平向右为 180°
     //
     // 使用角度映射（连续变化）：
-    //   归一化值 n ∈ [0,1] → 蓝线角度 angleBlue = n * 180°（0°=向右，90°=向上，180°=向左）
-    //   红线角度 angleRed = 180° - angleBlue（左右对称）
-    //   内部存储 rayslopeK = tan(angleRed)（红线斜率，数学坐标系）
+    //   归一化值 n ∈ [0,1] → redRayClockwiseDeg = n * 180°（0°=向左，90°=向上，180°=向右）
+    //   与蓝线角度关系：blueAngleDeg = redRayClockwiseDeg（数值等价）
+    //   数学角度（从 +X 逆时针）下：redMathDeg = 180° - redRayClockwiseDeg
     //
     // 映射关系：
-    //   n=0   → angleBlue=0°   → angleRed=180°  → rayslopeK=tan(180°)=0      → 蓝线向右，红线向左（水平）
-    //   n=0.25 → angleBlue=45° → angleRed=135° → rayslopeK=tan(135°)=-1     → 蓝线右上，红线左上
-    //   n=0.5 → angleBlue=90°  → angleRed=90°   → rayslopeK=tan(90°)=∞(近似) → 两线都垂直向上
-    //   n=1   → angleBlue=180° → angleRed=0°    → rayslopeK=tan(0°)=0        → 蓝线向左，红线向右（水平）
-    //
-    // 注意：由于斜率在90°趋于无穷，实际使用时用大数近似（±1e4）
-    //   角度定义：0°=向右，90°=向上，180°=向左（与常规极坐标一致）
-    
+    //   n=0    → redRayClockwiseDeg=0°   → 红线水平向左，蓝线水平向右
+    //   n=0.25 → redRayClockwiseDeg=45°  → 红线左上，蓝线右上
+    //   n=0.5  → redRayClockwiseDeg=90°  → 两线垂直向上
+    //   n=1    → redRayClockwiseDeg=180° → 红线水平向右，蓝线水平向左
+
     layout.add(std::make_unique<juce::AudioParameterFloat>(
-        ParameterIDs::rayslopeK,
-        "Red-Blue Laser Slope",
+        ParameterIDs::redRayClockwiseAngle,
+        "Red Ray Clockwise Angle",
         juce::NormalisableRange<float>(0.0f, 1.0f, 0.001f),
         0.25f,
         juce::AudioParameterFloatAttributes()
-            .withLabel("angle")
+            .withLabel("deg")
             .withStringFromValueFunction([](float value, int) {
-                // value 是归一化值 [0,1]，对应蓝线角度 0°-180°
-                // 显示蓝线角度（保留一位小数）
-                float blueAngleDeg = value * 180.0f;
-                return juce::String(blueAngleDeg, 1) + "°";
+                // value 是归一化值 [0,1]，显示红线顺时针角度（0°=向左）
+                float redRayClockwiseDeg = value * 180.0f;
+                return juce::String(redRayClockwiseDeg, 1) + "°";
             })
     ));
 
@@ -405,35 +391,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout PuponvstAudioProcessor::crea
 void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, float newValue)
 {
     // 当宿主自动化参数时，同步更新 EditorState
-    // newValue 是归一化值 [0,1]，对应蓝线角度 [0°, 180°]
+    // newValue 是归一化值 [0,1]，对应红线顺时针角度 [0°, 180°]
     EditorState s = getEditorState();
     bool stateChanged = false;
 
-    if (parameterID == ParameterIDs::rayslopeK)
+    if (parameterID == ParameterIDs::redRayClockwiseAngle)
     {
-        // 蓝线角度：0° = 向右，90° = 向上，180° = 向左
-        s.blueAngleDeg = newValue * 180.0f;
-        
-        // 计算对应的 rayslopeK（红线斜率）
-        // 角度定义：0° = 向右，90° = 向上，180° = 向左（与 calculateRayEndByAngle 一致）
-        // 红线角度 = 180° - 蓝线角度
-        // 红线斜率 = tan(angleRedRad)（数学坐标系中，角度从X轴正向逆时针测量）
-        float redAngleDeg = 180.0f - s.blueAngleDeg;
-        float redAngleRad = redAngleDeg * (juce::MathConstants<float>::pi / 180.0f);
-        
-        constexpr float kMaxSlope = 1.0e4f;
-        // 处理边界情况：cos(angle) = 0 时 tan 无穷大（垂直方向）
-        if (std::abs(std::cos(redAngleRad)) < 1e-6f)
-        {
-            // 红线垂直向上（90°）或垂直向下（270°）
-            // 根据 sin 的符号决定斜率方向（应该向上，所以 sin > 0）
-            s.rayslopeK = (std::sin(redAngleRad) >= 0) ? kMaxSlope : -kMaxSlope;
-        }
-        else
-        {
-            s.rayslopeK = std::tan(redAngleRad);
-        }
-        
+        s.redRayClockwiseDeg = newValue * 180.0f;
+        // redRayClockwiseDeg 与 blueAngleDeg 数值等价，方向解释不同。
+        // blueAngleDeg 解释：0°=向右，90°=向上，180°=向左。
+        s.blueAngleDeg = s.redRayClockwiseDeg;
+
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::sigma)

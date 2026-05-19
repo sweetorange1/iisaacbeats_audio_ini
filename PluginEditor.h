@@ -34,7 +34,7 @@ private:
     PuponvstAudioProcessor& processor;
     // GUI组件
     juce::Label titleLabel;       // 大标题 "Pupon"，字号 32
-    juce::Label versionLabel;     // 副标题 "v0.1.0 iisaacbeats.cn"，字号 20
+    juce::Label versionLabel;     // 副标题 "v0.9.8 iisaacbeats.cn"，字号 20
     juce::ComboBox qualityCombo;
     juce::ComboBox formantCombo;
 
@@ -53,11 +53,11 @@ private:
 
     // ===== 射线斜率模型 =====
     // 坐标系定义：以控制区域下边缘中点(bottomCenter)为原点，X轴水平向右，Y轴向上（数学坐标系）
-    // 蓝线角度：0° = 水平向左，90° = 垂直向上，180° = 水平向右
+    // 蓝线角度：0° = 水平向右，90° = 垂直向上，180° = 水平向左
     // 红线角度 = 180° - 蓝线角度（左右对称）
-    // rayslopeK = tan(红线角度 - 90°) 用于兼容现有计算
+    // 红线顺时针角度（以水平向左为 0°）与 blueAngleDeg 数值等价
     float blueAngleDeg = 90.0f;  // 蓝线角度（度），默认垂直向上
-    float rayslopeK = 0.0f;       // 红线斜率（数学坐标系下），由 blueAngleDeg 计算得出
+    float redRayClockwiseDeg = 90.0f;
     bool  isVerticalRay = false;  // 是否为垂直射线（k为无穷大时两线重合向正上方）
     
     // 射线交互状态
@@ -98,6 +98,9 @@ private:
     float distanceToNormalCurve(const juce::Point<float>& point, 
                                  const juce::Rectangle<int>& controlArea) const;
 
+    // 将控制区域转换为交互安全区，避免拖动命中窗口可缩放边缘。
+    juce::Rectangle<int> getInteractionSafeArea(const juce::Rectangle<int>& controlArea) const;
+
     // 过滤器抛物线几何辅助
     float getFilterAxisX(const juce::Rectangle<int>& controlArea) const;
     float getFilterParabolaY(float x, const juce::Rectangle<int>& controlArea) const;
@@ -110,7 +113,7 @@ private:
                                                const juce::Rectangle<int>& controlArea) const;
     
     // 根据角度计算射线终点（角度版本，更直观）
-    // angleDeg: 0° = 水平向左，90° = 垂直向上，180° = 水平向右
+    // angleDeg: 0° = 水平向右，90° = 垂直向上，180° = 水平向左
     // 返回射线与控制区域边界的交点(屏幕坐标)
     juce::Point<float> calculateRayEndByAngle(float angleDeg,
                                                const juce::Rectangle<int>& controlArea) const;
@@ -135,6 +138,11 @@ private:
     float getDotTrackTopY(int i, const juce::Rectangle<int>& controlArea) const;
     // 返回第 i 个圆点在当前 offsetT 下的屏幕中心坐标
     juce::Point<float> getDotCenter(int i, const juce::Rectangle<int>& controlArea) const;
+
+    // 声相映射辅助：根据 blueAngleDeg 计算当前 pan 区间 [panMin, panMax]
+    // 以及把 semitone 映射为最终 pan（与 push/paint 共用，避免重复逻辑）。
+    void getPanBoundsFromBlueAngle(float& outPanMin, float& outPanMax) const;
+    float getPanFromBlueAngleAndSemitone(int semitone) const;
 
     // ===== 参数同步：把 5 个圆点的 gain / pan 推送给 Processor（音频线程会读取）=====
     // 调用时机：初始化、拖动圆点 / 射线 / 正态曲线之后、窗口 resize 之后
