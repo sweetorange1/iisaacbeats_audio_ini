@@ -1,5 +1,5 @@
 #define MyAppName "Pupon"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.3"
 #define MyAppPublisher "iisaacbeats.cn"
 #define MyPluginBundle "Pupon.vst3"
 

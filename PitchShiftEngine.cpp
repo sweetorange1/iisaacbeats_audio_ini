@@ -6,6 +6,72 @@
 
 using RubberBand::RubberBandLiveShifter;
 
+namespace
+{
+// Probe the effective stream alignment by sending a single impulse through
+// the shifter and locating the strongest output sample.
+int estimateShifterLatencySamples(RubberBandLiveShifter& shifter, int rbBlockSize)
+{
+    if (rbBlockSize <= 0)
+        return 0;
+
+    const int probeBlocks = 48;
+    std::vector<float> in((size_t) rbBlockSize, 0.0f);
+    std::vector<float> out((size_t) rbBlockSize, 0.0f);
+
+    const float* inPtrs[1] = { in.data() };
+    float* outPtrs[1] = { out.data() };
+
+    bool impulseSent = false;
+    int sampleBase = 0;
+    float maxAbs = 0.0f;
+    int maxIndex = 0;
+
+    for (int block = 0; block < probeBlocks; ++block)
+    {
+        std::fill(in.begin(), in.end(), 0.0f);
+        if (!impulseSent)
+        {
+            in[0] = 1.0f;
+            impulseSent = true;
+        }
+
+        shifter.shift(inPtrs, outPtrs);
+
+        for (int i = 0; i < rbBlockSize; ++i)
+        {
+            const float a = std::abs(out[(size_t) i]);
+            if (a > maxAbs)
+            {
+                maxAbs = a;
+                maxIndex = sampleBase + i;
+            }
+        }
+
+        sampleBase += rbBlockSize;
+    }
+
+    if (maxAbs < 1.0e-8f)
+        return (int) shifter.getStartDelay();
+
+    return juce::jmax(0, maxIndex);
+}
+
+void primeDelayLine(std::vector<float>& ring, int& head, int& tail, int delaySamples)
+{
+    head = 0;
+    tail = 0;
+    if (delaySamples <= 0)
+        return;
+
+    if ((int) ring.size() < delaySamples)
+        ring.resize((size_t) delaySamples, 0.0f);
+
+    std::fill(ring.begin(), ring.end(), 0.0f);
+    tail = delaySamples;
+}
+}
+
 PitchShiftEngine::PitchShiftEngine()
 {
     for (int i = 0; i < kNumBands; ++i)
@@ -162,6 +228,8 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
     const int width = filterWidthSt.load(std::memory_order_relaxed);
 
     reportedLatency = 0;
+    bandLatencySamples.fill(0);
+    bandAlignDelaySamples.fill(0);
 
     for (int b = 0; b < kNumBands; ++b)
     {
@@ -201,11 +269,17 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
                 s.appliedHighCutHz = -1.0f;
                 updateBandFilters(b, ch, semitone, centerOffset, width);
 
-                // 记录延迟（五路相同，取任一即可；保守起见取最大）
-                // 注意：总延迟 = RubberBand内部延迟 + 输入缓冲延迟(rbBlockSize)
-                // 输入需要累积 rbBlockSize 个样本才能调用 shift()，这部分延迟必须报告给宿主
-                const int lat = (int)s.shifter->getStartDelay() + s.rbBlockSize;
-                reportedLatency = juce::jmax(reportedLatency, lat);
+                // 用脉冲探测估算该 band 的 shifter 延迟。
+                const int lat = estimateShifterLatencySamples(*s.shifter, s.rbBlockSize);
+                bandLatencySamples[(size_t)b] = juce::jmax(bandLatencySamples[(size_t)b], lat);
+
+                // 探测会推进内部状态，重置回实时处理初始态（保留当前 pitch ratio）。
+                s.shifter->reset();
+
+                s.alignDelaySamples = 0;
+                s.alignRing.clear();
+                s.alignHead = 0;
+                s.alignTail = 0;
             }
             else
             {
@@ -219,6 +293,10 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
                 s.outRing.clear();
                 s.outHead = 0;
                 s.outTail = 0;
+                s.alignDelaySamples = 0;
+                s.alignRing.clear();
+                s.alignHead = 0;
+                s.alignTail = 0;
                 for (auto& f : s.highPassFilters) f.reset();
                 for (auto& f : s.lowPassFilters)  f.reset();
                 s.appliedLowCutHz = -1.0f;
@@ -227,10 +305,49 @@ void PitchShiftEngine::prepare(double newSampleRate, int maxBlockSize, int numCh
         }
     }
 
+    // 以所有启用 band 的最大延迟作为统一时间基准，给每路补齐内部对齐延迟。
+    int maxBandLatency = 0;
+    for (int b = 0; b < kNumBands; ++b)
+    {
+        if (!bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            continue;
+        maxBandLatency = juce::jmax(maxBandLatency, bandLatencySamples[(size_t)b]);
+    }
+
+    for (int b = 0; b < kNumBands; ++b)
+    {
+        if (!bandEnabled[(size_t)b].load(std::memory_order_relaxed))
+            continue;
+
+        const int alignDelay = juce::jmax(0, maxBandLatency - bandLatencySamples[(size_t)b]);
+        bandAlignDelaySamples[(size_t)b] = alignDelay;
+
+        for (int ch = 0; ch < 2; ++ch)
+        {
+            auto& s = state[(size_t)b][(size_t)ch];
+            s.alignDelaySamples = alignDelay;
+
+            const int cap = juce::jmax(alignDelay + maxBlockSizePrepared * 2 + 32, 64);
+            s.alignRing.assign((size_t)cap, 0.0f);
+            primeDelayLine(s.alignRing, s.alignHead, s.alignTail, alignDelay);
+        }
+    }
+
+    reportedLatency = maxBandLatency;
+
     appliedFilterCenterOffsetSt = centerOffset;
     appliedFilterWidthSt = width;
     appliedPitchQualityMode = quality;
     appliedFormantMode = formant;
+}
+
+PitchShiftEngine::DelayBreakdown PitchShiftEngine::getDelayBreakdown() const noexcept
+{
+    DelayBreakdown out;
+    out.shifterLatencySamples = bandLatencySamples;
+    out.internalAlignDelaySamples = bandAlignDelaySamples;
+    out.reportedToHostSamples = reportedLatency;
+    return out;
 }
 
 void PitchShiftEngine::reset()
@@ -252,6 +369,8 @@ void PitchShiftEngine::reset()
             std::fill(s.outRing.begin(), s.outRing.end(), 0.0f);
             s.outHead = 0;
             s.outTail = 0;
+
+            primeDelayLine(s.alignRing, s.alignHead, s.alignTail, s.alignDelaySamples);
 
             for (auto& f : s.highPassFilters) f.reset();
             for (auto& f : s.lowPassFilters)  f.reset();
@@ -321,6 +440,54 @@ void PitchShiftEngine::ensureOutRingSpace(BandChannel& b, int extra)
         const int newCap = juce::jmax(cap * 2, b.outTail + extra + 32);
         b.outRing.resize((size_t)newCap, 0.0f);
     }
+}
+
+void PitchShiftEngine::ensureDelayRingSpace(BandChannel& b, int extra)
+{
+    const int cap = (int)b.alignRing.size();
+    if (cap <= 0)
+        return;
+    if (b.alignTail + extra <= cap)
+        return;
+
+    const int valid = b.alignTail - b.alignHead;
+    if (valid > 0 && b.alignHead > 0)
+        std::memmove(b.alignRing.data(),
+                     b.alignRing.data() + b.alignHead,
+                     (size_t)valid * sizeof(float));
+    b.alignTail -= b.alignHead;
+    b.alignHead = 0;
+
+    if (b.alignTail + extra > cap)
+    {
+        const int newCap = juce::jmax(cap * 2, b.alignTail + extra + 32);
+        b.alignRing.resize((size_t)newCap, 0.0f);
+    }
+}
+
+void PitchShiftEngine::applyAlignmentDelay(BandChannel& b, float* samples, int n)
+{
+    if (samples == nullptr || n <= 0 || b.alignDelaySamples <= 0)
+        return;
+
+    ensureDelayRingSpace(b, n);
+
+    std::memcpy(b.alignRing.data() + b.alignTail,
+                samples,
+                (size_t)n * sizeof(float));
+    b.alignTail += n;
+
+    const int avail = b.alignTail - b.alignHead;
+    const int take = juce::jmin(avail, n);
+    if (take > 0)
+    {
+        std::memcpy(samples,
+                    b.alignRing.data() + b.alignHead,
+                    (size_t)take * sizeof(float));
+        b.alignHead += take;
+    }
+    if (take < n)
+        std::memset(samples + take, 0, (size_t)(n - take) * sizeof(float));
 }
 
 void PitchShiftEngine::pumpInputToBand(int band, int ch, const float* src, int n)
@@ -484,10 +651,13 @@ void PitchShiftEngine::process(juce::AudioBuffer<float>& buffer)
             drainFromBand(b, 1, tmpR.data(), numSamples);
             processBandFilters(b, 0, tmpL.data(), numSamples);
             processBandFilters(b, 1, tmpR.data(), numSamples);
+            applyAlignmentDelay(state[(size_t)b][0], tmpL.data(), numSamples);
+            applyAlignmentDelay(state[(size_t)b][1], tmpR.data(), numSamples);
         }
         else
         {
             processBandFilters(b, 0, tmpL.data(), numSamples);
+            applyAlignmentDelay(state[(size_t)b][0], tmpL.data(), numSamples);
             std::memcpy(tmpR.data(), tmpL.data(), (size_t)numSamples * sizeof(float));
         }
 

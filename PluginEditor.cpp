@@ -96,7 +96,7 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
     titleLabel.setInterceptsMouseClicks(false, false);  // 允许鼠标事件穿透，以便编辑器统一处理点击
 
     // 副标题：仅显示版本号（普通无衬线字体，字号更小）
-    versionLabel.setText("v1.0.0", juce::dontSendNotification);
+    versionLabel.setText("v1.0.3", juce::dontSendNotification);
     versionLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.48f));
     versionLabel.setJustificationType(juce::Justification::centredLeft);
     {

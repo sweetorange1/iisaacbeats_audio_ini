@@ -135,6 +135,7 @@ private:
     // 记录 prepareToPlay 环境，供运行中重建 shifter 选项
     double preparedSampleRate = 44100.0;
     int preparedBlockSize = 512;
+    int lastReportedLatencySamples = -1;
     std::atomic<bool> pitchEngineOptionsDirty { false };
 
     // ===== 持久化的 UI 状态镜像（GUI 关闭时此处保留最新值，宿主存档读取于此）=====

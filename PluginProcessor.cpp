@@ -81,8 +81,9 @@ void PuponvstAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
     // 状态复位
     lastBarSeconds = 2.0;
 
-    // 把 Rubber Band LiveShifter 的启动延迟上报给宿主 DAW，便于延迟补偿
-    setLatencySamples(pitchEngine.getLatencySamples());
+    // 上报稳定的插件总延迟（内部各 band 已补齐到该基准）。
+    lastReportedLatencySamples = pitchEngine.getLatencySamples();
+    setLatencySamples(lastReportedLatencySamples);
 
     // 同步滤波器参数到引擎（避免某些宿主在恢复状态后未触发回调时出现不同步）
     if (auto* centerParam = apvts.getRawParameterValue(ParameterIDs::filterCenterSt))
@@ -150,7 +151,8 @@ void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
     {
         const int numCh = juce::jmax((int) totalNumInputChannels, (int) totalNumOutputChannels);
         pitchEngine.prepare(preparedSampleRate, preparedBlockSize, numCh);
-        setLatencySamples(pitchEngine.getLatencySamples());
+        lastReportedLatencySamples = pitchEngine.getLatencySamples();
+        setLatencySamples(lastReportedLatencySamples);
     }
 
     // 清理多余输出通道（例如输入是mono而输出是stereo等情况）
@@ -490,6 +492,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[0] = st;
         pitchEngine.setDotSemitoneOffset(0, st);
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot1Semitone)
@@ -497,6 +500,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[1] = st;
         pitchEngine.setDotSemitoneOffset(1, st);
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot2Semitone)
@@ -504,6 +508,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[2] = st;
         pitchEngine.setDotSemitoneOffset(2, st);
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot3Semitone)
@@ -511,6 +516,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[3] = st;
         pitchEngine.setDotSemitoneOffset(3, st);
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot4Semitone)
@@ -518,6 +524,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[4] = st;
         pitchEngine.setDotSemitoneOffset(4, st);
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
         stateChanged = true;
     }
 

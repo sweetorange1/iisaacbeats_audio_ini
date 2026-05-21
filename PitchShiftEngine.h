@@ -33,9 +33,8 @@ namespace RubberBand { class RubberBandLiveShifter; }
  * 由于 LiveShifter 的 shift() 必须按"固定 blockSize"调用，而 DAW 传入的
  * numSamples 不固定，这里用输入/输出环形缓冲适配任意块大小。
  *
- * LiveShifter 的启动延迟（getStartDelay()）通过 PluginProcessor 调用
- * setLatencySamples() 上报给 DAW，由 DAW 做延迟补偿；每路 band 的延迟相同，
- * 因此 5 路在输出端天然对齐，无需额外处理。
+ * 各 band 的变调延迟会因 pitch ratio 等参数不同而不同。
+ * 引擎内部会把每路补齐到同一参考延迟后再混音，并将该参考延迟上报给宿主。
  *
  * 线程安全：
  *   UI 线程调用 setDotGain / setDotPan（lock-free atomic）。
@@ -79,14 +78,24 @@ public:
     // 获取当前活动的band数量（用于调试：gain > 0 的 band 数量）
     int getActiveBandsCount() const noexcept { return activeBandsCount.load(std::memory_order_relaxed); }
 
-    // 供 PluginProcessor 上报给 DAW 做延迟补偿
+    struct DelayBreakdown
+    {
+        std::array<int, kNumBands> shifterLatencySamples { 0, 0, 0, 0, 0 };
+        std::array<int, kNumBands> internalAlignDelaySamples { 0, 0, 0, 0, 0 };
+        int reportedToHostSamples = 0;
+    };
+
+    // 供 PluginProcessor 上报给 DAW 做延迟补偿（稳定值，不随 gain 开关抖动）
     int  getLatencySamples() const noexcept { return reportedLatency; }
+    DelayBreakdown getDelayBreakdown() const noexcept;
 
 private:
     double sampleRate           = 44100.0;
     int    numChannelsPrepared  = 2;
     int    maxBlockSizePrepared = 512;
     int    reportedLatency      = 0;
+    std::array<int, kNumBands> bandLatencySamples { 0, 0, 0, 0, 0 };
+    std::array<int, kNumBands> bandAlignDelaySamples { 0, 0, 0, 0, 0 };
 
     // 每路 band × 每声道一个独立的 LiveShifter（单声道实例）
     // 使用 unique_ptr 是因为 RubberBandLiveShifter 的构造必须给出 sampleRate/channels，
@@ -106,6 +115,12 @@ private:
         std::vector<float> outRing;
         int                outHead = 0; // 待读起点
         int                outTail = 0; // 已写末端（exclusive），outTail >= outHead
+
+        // band 内部对齐补偿：在滤波后增加固定延迟，使所有 band 对齐到统一时间基准
+        int                alignDelaySamples = 0;
+        std::vector<float> alignRing;
+        int                alignHead = 0;
+        int                alignTail = 0;
 
         // 36dB/oct: 3 x 二阶高切 + 3 x 二阶低切（每声道独立状态）
         std::array<juce::IIRFilter, 3> highPassFilters;
@@ -149,6 +164,9 @@ private:
     int  drainFromBand(int band, int ch, float* dst, int n);
     // outRing 空间管理：保证能再写入 extra 个样本，必要时向前 shift
     void ensureOutRingSpace(BandChannel& b, int extra);
+    // 对单路样本施加固定对齐延迟（基于 FIFO）
+    void applyAlignmentDelay(BandChannel& b, float* samples, int n);
+    void ensureDelayRingSpace(BandChannel& b, int extra);
 
     // 计算某 band 的低切/高切频率（Hz）
     std::pair<float, float> computeBandCutoffsHz(int semitone, int centerOffset, int widthSt) const;
