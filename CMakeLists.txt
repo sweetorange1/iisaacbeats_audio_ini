@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(Puponvst VERSION 1.0.3 LANGUAGES C CXX)
+project(Puponvst VERSION 1.0.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -67,7 +67,7 @@ endif()
 juce_add_plugin(
         Puponvst
         PRODUCT_NAME "Pupon"
-        VERSION 1.0.3
+        VERSION 1.0.4
         COMPANY_NAME "iisaacbeas.cn"
         BUNDLE_ID "cn.iisaacbeas.Pupon"
         PLUGIN_MANUFACTURER_CODE Pupo

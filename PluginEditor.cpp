@@ -96,7 +96,7 @@ PuponvstAudioProcessorEditor::PuponvstAudioProcessorEditor(PuponvstAudioProcesso
     titleLabel.setInterceptsMouseClicks(false, false);  // 允许鼠标事件穿透，以便编辑器统一处理点击
 
     // 副标题：仅显示版本号（普通无衬线字体，字号更小）
-    versionLabel.setText("v1.0.3", juce::dontSendNotification);
+    versionLabel.setText("v1.0.4", juce::dontSendNotification);
     versionLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.48f));
     versionLabel.setJustificationType(juce::Justification::centredLeft);
     {
@@ -1044,6 +1044,15 @@ void PuponvstAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
             && mousePos.y >= yTop && mousePos.y <= yBot)
         {
             draggingDotColumnIndex = i;
+            const juce::String semitoneParamIDs[5] = {
+                ParameterIDs::dot0Semitone,
+                ParameterIDs::dot1Semitone,
+                ParameterIDs::dot2Semitone,
+                ParameterIDs::dot3Semitone,
+                ParameterIDs::dot4Semitone
+            };
+            if (auto* param = processor.getAPVTS().getParameter(semitoneParamIDs[i]))
+                param->beginChangeGesture();
             return;
         }
     }
@@ -1301,6 +1310,7 @@ void PuponvstAudioProcessorEditor::mouseUp(const juce::MouseEvent&)
 {
     const bool wasDraggingDot = (draggingDotIndex >= 0);
     const bool wasDraggingDotColumn = (draggingDotColumnIndex >= 0);
+    const int releasedDotColumnIndex = draggingDotColumnIndex;
     const bool wasDraggingRay = (isDraggingRedLine || isDraggingBlueLine);
     const bool wasDraggingCurve = isDraggingNormalCurve;
     const bool wasDraggingFilterAxis = isDraggingFilterAxis;
@@ -1335,10 +1345,14 @@ void PuponvstAudioProcessorEditor::mouseUp(const juce::MouseEvent&)
             ParameterIDs::dot3Semitone,
             ParameterIDs::dot4Semitone
         };
-        for (int i = 0; i < 5; ++i)
+        // 仅提交本次实际被拖动的一路，避免松手时触发 5 路无效参数通知。
+        if (releasedDotColumnIndex >= 0 && releasedDotColumnIndex < 5)
         {
-            if (auto* param = processor.getAPVTS().getParameter(semitoneParamIDs[i]))
+            if (auto* param = processor.getAPVTS().getParameter(semitoneParamIDs[(size_t)releasedDotColumnIndex]))
+            {
                 param->setValueNotifyingHost(param->getValue());
+                param->endChangeGesture();
+            }
         }
     }
 

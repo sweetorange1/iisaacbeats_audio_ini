@@ -3,6 +3,17 @@
 #include "PluginEditor.h"
 #include <cmath>
 
+namespace
+{
+constexpr std::array<const char*, 5> kDotGainParamIds {
+    "dot0", "dot1", "dot2", "dot3", "dot4"
+};
+
+constexpr std::array<const char*, 5> kDotSemitoneParamIds {
+    "dot0Semitone", "dot1Semitone", "dot2Semitone", "dot3Semitone", "dot4Semitone"
+};
+}
+
 PuponvstAudioProcessor::PuponvstAudioProcessor()
     : juce::AudioProcessor (BusesProperties()
 #if ! JucePlugin_IsMidiEffect
@@ -31,6 +42,9 @@ PuponvstAudioProcessor::PuponvstAudioProcessor()
     apvts.addParameterListener(ParameterIDs::dot2Semitone, this);
     apvts.addParameterListener(ParameterIDs::dot3Semitone, this);
     apvts.addParameterListener(ParameterIDs::dot4Semitone, this);
+
+    // Ensure audio-side defaults are valid even before any editor is created.
+    syncEngineFromParameters();
 }
 
 PuponvstAudioProcessor::~PuponvstAudioProcessor() 
@@ -72,11 +86,22 @@ void PuponvstAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
     std::fill(oscilloscopeBuffer.begin(), oscilloscopeBuffer.end(), 0.0f);
     oscilloscopeWritePos = 0;
 
+    // 先把当前参数镜像到引擎（prepare 会读取这些状态决定内部配置）
+    syncEngineFromParameters();
+
     // 初始化音频处理引擎
     const int numCh = juce::jmax(getTotalNumInputChannels(), getTotalNumOutputChannels());
     preparedSampleRate = sampleRate;
     preparedBlockSize = samplesPerBlock;
+    stateSwitchFadeOutSamplesTotal = juce::jmax(32, (int) std::lround(sampleRate * 0.012)); // 12ms
+    stateSwitchFadeInSamplesTotal = juce::jmax(32, (int) std::lround(sampleRate * 0.060));  // 60ms
+    stateSwitchFadeOutSamplesRemaining.store(0, std::memory_order_relaxed);
+    stateSwitchFadeInSamplesRemaining.store(0, std::memory_order_relaxed);
+    lastOutputSample = { 0.0f, 0.0f };
     pitchEngine.prepare(sampleRate, samplesPerBlock, numCh);
+
+    // prepare 后再次同步一次，确保 dot gain/pan 等实时参数和当前状态一致。
+    syncEngineFromParameters();
 
     // 状态复位
     lastBarSeconds = 2.0;
@@ -85,25 +110,6 @@ void PuponvstAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBloc
     lastReportedLatencySamples = pitchEngine.getLatencySamples();
     setLatencySamples(lastReportedLatencySamples);
 
-    // 同步滤波器参数到引擎（避免某些宿主在恢复状态后未触发回调时出现不同步）
-    if (auto* centerParam = apvts.getRawParameterValue(ParameterIDs::filterCenterSt))
-        pitchEngine.setFilterCenterOffsetSemitones((int) std::lround(centerParam->load()));
-    if (auto* widthParam = apvts.getRawParameterValue(ParameterIDs::filterWidthSt))
-        pitchEngine.setFilterWidthSemitones((int) std::lround(widthParam->load()));
-    if (auto* qualityParam = apvts.getRawParameterValue(ParameterIDs::rbPitchQuality))
-        pitchEngine.setPitchQualityMode((int) std::lround(qualityParam->load()));
-    if (auto* formantParam = apvts.getRawParameterValue(ParameterIDs::rbFormantMode))
-        pitchEngine.setFormantMode((int) std::lround(formantParam->load()));
-    if (auto* st0 = apvts.getRawParameterValue(ParameterIDs::dot0Semitone))
-        pitchEngine.setDotSemitoneOffset(0, (int) std::lround(st0->load()));
-    if (auto* st1 = apvts.getRawParameterValue(ParameterIDs::dot1Semitone))
-        pitchEngine.setDotSemitoneOffset(1, (int) std::lround(st1->load()));
-    if (auto* st2 = apvts.getRawParameterValue(ParameterIDs::dot2Semitone))
-        pitchEngine.setDotSemitoneOffset(2, (int) std::lround(st2->load()));
-    if (auto* st3 = apvts.getRawParameterValue(ParameterIDs::dot3Semitone))
-        pitchEngine.setDotSemitoneOffset(3, (int) std::lround(st3->load()));
-    if (auto* st4 = apvts.getRawParameterValue(ParameterIDs::dot4Semitone))
-        pitchEngine.setDotSemitoneOffset(4, (int) std::lround(st4->load()));
 }
 
 void PuponvstAudioProcessor::releaseResources()
@@ -153,6 +159,7 @@ void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
         pitchEngine.prepare(preparedSampleRate, preparedBlockSize, numCh);
         lastReportedLatencySamples = pitchEngine.getLatencySamples();
         setLatencySamples(lastReportedLatencySamples);
+        armStateSwitchFadeIn();
     }
 
     // 清理多余输出通道（例如输入是mono而输出是stereo等情况）
@@ -186,6 +193,79 @@ void PuponvstAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce
 
     // ===== 核心音频处理：5 路重采样 pitch shift + 混音 + 声相 + 硬削波 =====
     pitchEngine.process(buffer);
+
+    // 对状态切换（如切换预设）应用更强的两段包络：先淡出旧输出，再淡入新输出。
+    int fadeOutRemaining = stateSwitchFadeOutSamplesRemaining.load(std::memory_order_relaxed);
+    int fadeInRemaining = stateSwitchFadeInSamplesRemaining.load(std::memory_order_relaxed);
+    if ((fadeOutRemaining > 0 && stateSwitchFadeOutSamplesTotal > 0)
+        || (fadeInRemaining > 0 && stateSwitchFadeInSamplesTotal > 0))
+    {
+        const int outCh = (int) totalNumOutputChannels;
+        const int n = buffer.getNumSamples();
+
+        float prevOut[2] = { lastOutputSample[0], lastOutputSample[1] };
+
+        for (int i = 0; i < n; ++i)
+        {
+            if (fadeOutRemaining > 0)
+            {
+                const float outT = juce::jlimit(0.0f, 1.0f,
+                    (float) fadeOutRemaining / (float) stateSwitchFadeOutSamplesTotal);
+
+                for (int ch = 0; ch < outCh; ++ch)
+                {
+                    float* out = buffer.getWritePointer(ch);
+                    // Force a guaranteed smooth bridge from previous sample to silence.
+                    const float y = prevOut[ch] * outT;
+                    out[i] = y;
+                    prevOut[ch] = y;
+                }
+
+                --fadeOutRemaining;
+                if (fadeOutRemaining == 0 && fadeInRemaining <= 0)
+                    fadeInRemaining = stateSwitchFadeInSamplesTotal;
+                continue;
+            }
+
+            if (fadeInRemaining > 0)
+            {
+                const float inT = juce::jlimit(0.0f, 1.0f,
+                    1.0f - ((float) fadeInRemaining / (float) stateSwitchFadeInSamplesTotal));
+
+                for (int ch = 0; ch < outCh; ++ch)
+                {
+                    float* out = buffer.getWritePointer(ch);
+                    const float x = out[i];
+                    // Fade new stream in from silence while preserving per-sample continuity.
+                    const float target = x * inT;
+                    const float y = prevOut[ch] + (target - prevOut[ch]) * 0.6f;
+                    out[i] = y;
+                    prevOut[ch] = y;
+                }
+
+                --fadeInRemaining;
+                continue;
+            }
+
+            for (int ch = 0; ch < outCh; ++ch)
+                prevOut[ch] = buffer.getReadPointer(ch)[i];
+        }
+
+        for (int ch = 0; ch < juce::jmin(2, outCh); ++ch)
+            lastOutputSample[(size_t) ch] = prevOut[ch];
+
+        stateSwitchFadeOutSamplesRemaining.store(juce::jmax(0, fadeOutRemaining), std::memory_order_relaxed);
+        stateSwitchFadeInSamplesRemaining.store(juce::jmax(0, fadeInRemaining), std::memory_order_relaxed);
+    }
+    else
+    {
+        const int outCh = (int) totalNumOutputChannels;
+        if (buffer.getNumSamples() > 0)
+        {
+            for (int ch = 0; ch < juce::jmin(2, outCh); ++ch)
+                lastOutputSample[(size_t) ch] = buffer.getReadPointer(ch)[buffer.getNumSamples() - 1];
+        }
+    }
 
     // 示例波形：抓取主输出的第0通道（已是处理后的信号）
     if (totalNumOutputChannels > 0)
@@ -250,6 +330,13 @@ void PuponvstAudioProcessor::getStateInformation(juce::MemoryBlock& destData)
 
 void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInBytes)
 {
+    isRestoringState.store(true, std::memory_order_release);
+    struct RestoreFlagGuard
+    {
+        std::atomic<bool>& flag;
+        ~RestoreFlagGuard() { flag.store(false, std::memory_order_release); }
+    } restoreGuard { isRestoringState };
+
     if (auto xml = getXmlFromBinary(data, sizeInBytes))
     {
         if (!xml->hasTagName("PuponState"))
@@ -291,7 +378,13 @@ void PuponvstAudioProcessor::setStateInformation(const void* data, int sizeInByt
         // 兼容参数重命名：无论旧工程是否包含新 APVTS ID，都以恢复出的角度回写当前参数。
         if (auto* angleParam = apvts.getParameter(ParameterIDs::redRayClockwiseAngle))
             angleParam->setValue(juce::jlimit(0.0f, 1.0f, s.redRayClockwiseDeg / 180.0f));
+
+        // 某些宿主在恢复阶段不会立即创建编辑器，这里必须直接同步音频引擎。
+        syncEngineFromParameters();
+        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        armStateSwitchFadeIn();
     }
+
 }
 
 // 插件入口实现
@@ -433,6 +526,7 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
     // newValue 是归一化值 [0,1]，对应红线顺时针角度 [0°, 180°]
     EditorState s = getEditorState();
     bool stateChanged = false;
+    const bool deferEngineApply = isRestoringState.load(std::memory_order_acquire);
 
     if (parameterID == ParameterIDs::redRayClockwiseAngle)
     {
@@ -441,6 +535,8 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         // blueAngleDeg 解释：0°=向右，90°=向上，180°=向左。
         s.blueAngleDeg = s.redRayClockwiseDeg;
 
+        if (!deferEngineApply)
+            updateDotGainsAndPansFromParameters();
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::sigma)
@@ -452,27 +548,37 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         
         float newSigma = juce::jlimit(0.24f, 8.0f, actualSigma);
         s.sigma = newSigma;
+        if (!deferEngineApply)
+            updateDotGainsAndPansFromParameters();
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::filterCenterSt)
     {
         const int centerSt = juce::jlimit(-36, +36, (int) std::lround(newValue));
-        pitchEngine.setFilterCenterOffsetSemitones(centerSt);
+        if (!deferEngineApply)
+            pitchEngine.setFilterCenterOffsetSemitones(centerSt);
     }
     else if (parameterID == ParameterIDs::filterWidthSt)
     {
         const int widthSt = juce::jlimit(10, 72, (int) std::lround(newValue));
-        pitchEngine.setFilterWidthSemitones(widthSt);
+        if (!deferEngineApply)
+            pitchEngine.setFilterWidthSemitones(widthSt);
     }
     else if (parameterID == ParameterIDs::rbPitchQuality)
     {
-        pitchEngine.setPitchQualityMode((int) std::lround(newValue));
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setPitchQualityMode((int) std::lround(newValue));
+            pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        }
     }
     else if (parameterID == ParameterIDs::rbFormantMode)
     {
-        pitchEngine.setFormantMode((int) std::lround(newValue));
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setFormantMode((int) std::lround(newValue));
+            pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        }
     }
     else if (parameterID == ParameterIDs::dot0
           || parameterID == ParameterIDs::dot1
@@ -484,6 +590,8 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         if (dotIndex >= 0 && dotIndex < 5)
         {
             s.dotOffsetT[dotIndex] = juce::jlimit(0.0f, 1.0f, newValue);
+            if (!deferEngineApply)
+                updateDotGainsAndPansFromParameters();
             stateChanged = true;
         }
     }
@@ -491,40 +599,55 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
     {
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[0] = st;
-        pitchEngine.setDotSemitoneOffset(0, st);
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setDotSemitoneOffset(0, st);
+            updateDotGainsAndPansFromParameters();
+        }
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot1Semitone)
     {
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[1] = st;
-        pitchEngine.setDotSemitoneOffset(1, st);
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setDotSemitoneOffset(1, st);
+            updateDotGainsAndPansFromParameters();
+        }
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot2Semitone)
     {
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[2] = st;
-        pitchEngine.setDotSemitoneOffset(2, st);
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setDotSemitoneOffset(2, st);
+            updateDotGainsAndPansFromParameters();
+        }
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot3Semitone)
     {
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[3] = st;
-        pitchEngine.setDotSemitoneOffset(3, st);
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setDotSemitoneOffset(3, st);
+            updateDotGainsAndPansFromParameters();
+        }
         stateChanged = true;
     }
     else if (parameterID == ParameterIDs::dot4Semitone)
     {
         const int st = juce::jlimit(-36, +36, (int) std::lround(newValue));
         s.dotSemitoneOffsets[4] = st;
-        pitchEngine.setDotSemitoneOffset(4, st);
-        pitchEngineOptionsDirty.store(true, std::memory_order_release);
+        if (!deferEngineApply)
+        {
+            pitchEngine.setDotSemitoneOffset(4, st);
+            updateDotGainsAndPansFromParameters();
+        }
         stateChanged = true;
     }
 
@@ -533,3 +656,97 @@ void PuponvstAudioProcessor::parameterChanged(const juce::String& parameterID, f
         setEditorState(s);
     }
 }
+
+void PuponvstAudioProcessor::syncEngineFromParameters()
+{
+    if (auto* centerParam = apvts.getRawParameterValue(ParameterIDs::filterCenterSt))
+        pitchEngine.setFilterCenterOffsetSemitones((int) std::lround(centerParam->load()));
+    if (auto* widthParam = apvts.getRawParameterValue(ParameterIDs::filterWidthSt))
+        pitchEngine.setFilterWidthSemitones((int) std::lround(widthParam->load()));
+    if (auto* qualityParam = apvts.getRawParameterValue(ParameterIDs::rbPitchQuality))
+        pitchEngine.setPitchQualityMode((int) std::lround(qualityParam->load()));
+    if (auto* formantParam = apvts.getRawParameterValue(ParameterIDs::rbFormantMode))
+        pitchEngine.setFormantMode((int) std::lround(formantParam->load()));
+
+    updateDotGainsAndPansFromParameters();
+}
+
+void PuponvstAudioProcessor::updateDotGainsAndPansFromParameters() noexcept
+{
+    float blueAngleDeg = 90.0f;
+    if (auto* angleParam = apvts.getRawParameterValue(ParameterIDs::redRayClockwiseAngle))
+        blueAngleDeg = juce::jlimit(0.0f, 180.0f, angleParam->load() * 180.0f);
+
+    float sigma = 2.70f;
+    if (auto* sigmaParam = apvts.getRawParameterValue(ParameterIDs::sigma))
+        sigma = juce::jlimit(0.24f, 8.0f, sigmaParam->load());
+
+    for (int i = 0; i < 5; ++i)
+    {
+        float dotOffset = 1.0f;
+        if (auto* dotParam = apvts.getRawParameterValue(kDotGainParamIds[(size_t) i]))
+            dotOffset = juce::jlimit(0.0f, 1.0f, dotParam->load());
+
+        int semitone = PitchShiftEngine::kDefaultSemitones[(size_t) i];
+        if (auto* stParam = apvts.getRawParameterValue(kDotSemitoneParamIds[(size_t) i]))
+            semitone = juce::jlimit(-36, +36, (int) std::lround(stParam->load()));
+
+        pitchEngine.setDotSemitoneOffset(i, semitone);
+        pitchEngine.setDotGain(i, computeGainFromDotState(dotOffset, semitone, sigma));
+        pitchEngine.setDotPan(i, computePanFromBlueAngleAndSemitone(blueAngleDeg, semitone));
+    }
+}
+
+float PuponvstAudioProcessor::computePanFromBlueAngleAndSemitone(float blueAngleDeg, int semitone) noexcept
+{
+    if (semitone == 0)
+        return 0.0f;
+
+    const float angleClamped = juce::jlimit(0.0f, 180.0f, blueAngleDeg);
+
+    float panMin = 0.0f;
+    float panMax = 0.0f;
+    if (angleClamped >= 45.0f && angleClamped <= 135.0f)
+    {
+        const float dCenter = juce::jlimit(0.0f, 1.0f, std::abs(angleClamped - 90.0f) / 45.0f);
+        panMin = 0.0f;
+        panMax = juce::jlimit(0.0f, 1.0f, dCenter * (1.2f - 0.2f * dCenter));
+    }
+    else
+    {
+        const float dOuter = (angleClamped < 45.0f)
+            ? juce::jlimit(0.0f, 1.0f, (45.0f - angleClamped) / 45.0f)
+            : juce::jlimit(0.0f, 1.0f, (angleClamped - 135.0f) / 45.0f);
+        panMin = dOuter;
+        panMax = 1.0f;
+    }
+
+    const float stNorm = juce::jlimit(-1.0f, 1.0f, (float) juce::jlimit(-36, +36, semitone) / 36.0f);
+    const float magnitude = juce::jlimit(0.0f, 1.0f,
+        panMin + (panMax - panMin) * std::abs(stNorm));
+
+    const float directionFlipByAngle = (angleClamped <= 90.0f) ? 1.0f : -1.0f;
+    const float signedPan = directionFlipByAngle * ((stNorm >= 0.0f) ? magnitude : -magnitude);
+    return juce::jlimit(-1.0f, 1.0f, signedPan);
+}
+
+float PuponvstAudioProcessor::computeGainFromDotState(float dotOffsetT, int semitone, float sigma) noexcept
+{
+    const float t = juce::jlimit(0.0f, 1.0f, dotOffsetT);
+    const float sigmaSafe = juce::jlimit(0.24f, 8.0f, sigma);
+    const float stNorm = (float) juce::jlimit(-36, +36, semitone) / 12.0f;
+    const float gaussian = std::exp(-0.5f * stNorm * stNorm / (sigmaSafe * sigmaSafe));
+    return juce::jlimit(0.0f, 1.0f, t * gaussian);
+}
+
+void PuponvstAudioProcessor::armStateSwitchFadeIn() noexcept
+{
+    if (stateSwitchFadeOutSamplesTotal > 0)
+        stateSwitchFadeOutSamplesRemaining.store(stateSwitchFadeOutSamplesTotal, std::memory_order_relaxed);
+    else if (stateSwitchFadeInSamplesTotal > 0)
+        stateSwitchFadeInSamplesRemaining.store(stateSwitchFadeInSamplesTotal, std::memory_order_relaxed);
+
+    if (stateSwitchFadeOutSamplesTotal > 0)
+        stateSwitchFadeInSamplesRemaining.store(0, std::memory_order_relaxed);
+}
+

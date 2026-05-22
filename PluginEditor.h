@@ -127,7 +127,7 @@ private:
     PuponvstAudioProcessor& processor;
     // GUI组件
     juce::Label titleLabel;       // 大标题 "Pupon"，字号 32
-    juce::Label versionLabel;     // 副标题 "v1.0.3"，小号普通无衬线字体
+    juce::Label versionLabel;     // 副标题 "v1.0.4"，小号普通无衬线字体
     bool isTitleHovered = false;
     PresetArrowButton presetPrevButton { "<" };
     HeaderComboBox presetCombo;

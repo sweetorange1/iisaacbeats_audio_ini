@@ -115,6 +115,12 @@ public:
     // 视觉同步：UI 通过此 getter 获取相关状态
 
 private:
+    void syncEngineFromParameters();
+    void updateDotGainsAndPansFromParameters() noexcept;
+    static float computePanFromBlueAngleAndSemitone(float blueAngleDeg, int semitone) noexcept;
+    static float computeGainFromDotState(float dotOffsetT, int semitone, float sigma) noexcept;
+    void armStateSwitchFadeIn() noexcept;
+
     // 参数系统
     juce::AudioProcessorValueTreeState apvts;
 
@@ -137,6 +143,12 @@ private:
     int preparedBlockSize = 512;
     int lastReportedLatencySamples = -1;
     std::atomic<bool> pitchEngineOptionsDirty { false };
+    int stateSwitchFadeOutSamplesTotal = 0;
+    int stateSwitchFadeInSamplesTotal = 0;
+    std::atomic<int> stateSwitchFadeOutSamplesRemaining { 0 };
+    std::atomic<int> stateSwitchFadeInSamplesRemaining { 0 };
+    std::atomic<bool> isRestoringState { false };
+    std::array<float, 2> lastOutputSample { 0.0f, 0.0f };
 
     // ===== 持久化的 UI 状态镜像（GUI 关闭时此处保留最新值，宿主存档读取于此）=====
     // 由 Editor 在每次交互后通过 setEditorState() 推送；Editor 重新打开时通过 getEditorState() 拉取。
